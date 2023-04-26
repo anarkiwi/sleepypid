@@ -36,8 +36,8 @@ typedef struct eepromConfigType {
 } eepromConfigType;
 
 const configType defaultConfig {
-  12.8, // shutdownVoltage: 12V-14V
-  13.0, // startupVoltage: 12V-14V, less than shutdownVoltage
+  12.8, // shutdownVoltage: 12V-30V
+  13.0, // startupVoltage: 12V-30V, less than shutdownVoltage
   150, // shutdownRpiCurrent: 50mA-800mA
   90, // snoozeTimeout: 90s-600s
   true, // overrideEnabled
@@ -286,7 +286,7 @@ bool voltageValid(float voltage) {
   if (voltage < 12) {
     return false;
   }
-  if (voltage > 14) {
+  if (voltage > 30) {
     return false;
   }
   return true;
