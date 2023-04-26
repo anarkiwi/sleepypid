@@ -1,0 +1,32 @@
+name: arduino-test
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@master
+      - name: Install
+        run: |
+          sudo apt-get update && sudo apt-get -qyf install wget unzip python3-dev
+          pip3 install -r requirements.txt
+          PYTHONPATH=sleepypid ./sleepypid/test_sleepypid.py
+          wget -O/tmp/ide.zip https://downloads.arduino.cc/arduino-ide/arduino-ide_2.1.0_Linux_64bit.zip
+          unzip /tmp/ide.zip
+          find arduino-ide* -name python3 -exec ln -sf $(which python3) {} \;
+          mkdir ~/bin
+          ln -s ~/arduino*/arduino-ide ~/bin/arduino
+          PATH=~/bin:$PATH curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=~/bin sh
+          mkdir -p ~/.arduino15/packages
+          PATH=~/bin:$PATH arduino-cli config init
+          PATH=~/bin:$PATH arduino-cli core update-index
+          PATH=~/bin:$PATH arduino-cli core install arduino:avr
+          PATH=~/bin:$PATH arduino-cli lib update-index
+          PATH=~/bin:$PATH arduino-cli lib install "Sleepy Pi 2"
+          PATH=~/bin:$PATH arduino-cli lib install PCF8523
+          PATH=~/bin:$PATH arduino-cli lib install Time
+          PATH=~/bin:$PATH arduino-cli lib install LowPower_LowPowerLab
+          PATH=~/bin:$PATH arduino-cli lib install ArduinoJson
+          PATH=~/bin:$PATH arduino-cli lib install CRC32
+      - name: Compile Sketch
+        run: PATH=~/bin:$PATH arduino-cli compile --fqbn arduino:avr:uno sleepypi/sleepypi.ino
