@@ -29,4 +29,4 @@ jobs:
           PATH=~/bin:$PATH arduino-cli lib install ArduinoJson
           PATH=~/bin:$PATH arduino-cli lib install CRC32
       - name: Compile Sketch
-        run: PATH=~/bin:$PATH arduino-cli compile --fqbn arduino:avr:uno sleepypi/sleepypi.ino
+        run: PATH=~/bin:$PATH arduino-cli compile --fqbn arduino:avr:fio sleepypi/sleepypi.ino
