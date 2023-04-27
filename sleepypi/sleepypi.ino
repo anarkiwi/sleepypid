@@ -1,7 +1,9 @@
 // IDE configuration:
 //
+// * Close power bypass jumper
 // * Set Tools/Board/Arduino AVR Boards/Arduino Fio
 // * Set Tools/Port/ttyUSB<n>
+// * Open power bypass jumper
 //
 // Library installation:
 //
@@ -10,9 +12,7 @@
 // * LowPower_LowPowerLab (needed for Sleepy Pi 2 lib)
 // * PCF8523
 // * Sleepy Pi 2
-// * Time 1.6
-//
-// TODO: upgrade Time, when Sleepy Pi 2 releases > 1.0.0.
+// * TimeLib
 
 #include <CRC32.h>
 #include <ArduinoJson.h>
@@ -43,7 +43,7 @@ const configType defaultConfig {
   true, // overrideEnabled
 };
 
-const char fwVersion[] = "1.0.3";
+const char fwVersion[] = "1.0.4";
 const byte bufferSize = 192;
 const byte alarmPin = 0;
 const byte buttonPin = 1;
