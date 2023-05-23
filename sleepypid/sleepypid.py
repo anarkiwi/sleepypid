@@ -18,7 +18,7 @@ from collections import defaultdict
 import serial
 
 MIN_SLEEP_MINS = 15
-MAX_SLEEP_MINS = (24 * 60) - MIN_SLEEP_MINS
+MAX_SLEEP_MINS = (12 * 60) - MIN_SLEEP_MINS
 MEAN_V = 'mean1mSupplyVoltage'
 MEAN_C = 'mean1mRpiCurrent'
 SHUTDOWN_TIMEOUT = 60
