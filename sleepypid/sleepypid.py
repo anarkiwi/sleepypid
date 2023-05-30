@@ -18,7 +18,7 @@ from collections import defaultdict
 import serial
 
 MIN_SLEEP_MINS = 15
-MAX_SLEEP_MINS = (24 * 60) - MIN_SLEEP_MINS
+MAX_SLEEP_MINS = (6 * 60) - MIN_SLEEP_MINS
 MEAN_V = 'mean1mSupplyVoltage'
 MEAN_C = 'mean1mRpiCurrent'
 SHUTDOWN_TIMEOUT = 60
@@ -154,8 +154,8 @@ def log_grafana(grafana, grafana_path, obj, write_results):
         hostname = socket.gethostname()
         os.makedirs(grafana_path, exist_ok=True)
         with open(f'{grafana_path}/{hostname}-{timestamp}-sleepypi.json', 'w', encoding='utf-8') as f:
-            for key in sensor_data.keys():
-                record = {"target":key, "datapoints": sensor_data[key]}
+            for k, v in sensor_data.items():
+                record = {"target": k, "datapoints": v}
                 f.write(f'{json.dumps(record)}\n')
         sensor_data = {}
 
@@ -240,7 +240,7 @@ def loop(args):
                     log_json(args.log, args.grafana, args.grafana_path, window_summary, args.window_samples*60, args.polltime*ticker)
 
                     if args.sleepscript and (sample_count % args.window_samples == 0):
-                        duration = sleep_duty_seconds(soc, MIN_SLEEP_MINS, MAX_SLEEP_MINS)
+                        duration = sleep_duty_seconds(soc, args.minsleepmins, args.maxsleepmins)
                         if duration:
                             send_command({'command': 'snooze', 'duration': duration}, args)
                             log_grafana(args.grafana, args.grafana_path, window_summary, True)
@@ -285,6 +285,12 @@ def parse_args():
     parser.add_argument(
         '--fullvoltage', default=13.3, type=float,
         help='voltage at which the battery is considered full')
+    parser.add_argument(
+        '--minsleepmins', default=MIN_SLEEP_MINS, type=float,
+        help='minimum time to sleep')
+    parser.add_argument(
+        '--maxsleepmins', default=MAX_SLEEP_MINS, type=float,
+        help='maximum time to sleep')
     parser.add_argument(
         '--overrideenabled', default=1, type=int,
         help='enable the sleepypi power override button')
