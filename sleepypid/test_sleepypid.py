@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import datetime
 import json
 import os
 import tempfile
@@ -9,7 +10,8 @@ from prometheus_client import REGISTRY
 import sleepypid
 from sleepypid import (
     get_uptime, mean_diff, sleep_duty_seconds, calc_soc, flatten_telemetry,
-    log_prometheus, call_script, parse_args, override_args)
+    log_prometheus, call_script, parse_args, override_args,
+    daylength_hours, seasonal_fullvoltage)
 
 
 class SleepyidTestCase(unittest.TestCase):
@@ -32,6 +34,47 @@ class SleepyidTestCase(unittest.TestCase):
         self.assertEqual(0, calc_soc(12.9, args))
         self.assertEqual(0, calc_soc(12.8, args))
         self.assertAlmostEqual(50, calc_soc(13.1, args), places=2)
+
+    def test_calc_soc_dynamic_fullvoltage(self):
+        args = namedtuple('args', ('fullvoltage', 'shutdownvoltage'))
+        args.fullvoltage = 26.0
+        args.shutdownvoltage = 24.3
+        # default uses args.fullvoltage
+        self.assertAlmostEqual(41.18, calc_soc(25.0, args), places=1)
+        # an explicit (e.g. winter) higher full -> lower SOC for the same
+        # voltage -> the Pi is more likely to sleep
+        soc_summer = calc_soc(25.0, args, 26.0)
+        soc_winter = calc_soc(25.0, args, 27.0)
+        self.assertGreater(soc_summer, soc_winter)
+        self.assertAlmostEqual(25.93, soc_winter, places=1)
+
+    def test_daylength_hours(self):
+        # southern hemisphere: winter solstice (Jun) shorter than summer (Dec)
+        june = daylength_hours(172, -41.1)
+        december = daylength_hours(355, -41.1)
+        self.assertLess(june, december)
+        self.assertAlmostEqual(june, 9.2, delta=0.4)
+        self.assertAlmostEqual(december, 15.1, delta=0.4)
+        # equator is ~12h year round
+        self.assertAlmostEqual(daylength_hours(172, 0.0), 12.0, delta=0.2)
+
+    def test_seasonal_fullvoltage(self):
+        args = namedtuple('args', ('fullvoltage', 'winter_fullvoltage', 'latitude'))
+        args.fullvoltage = 26.0
+        args.winter_fullvoltage = 27.0
+        args.latitude = -41.102223
+        winter = seasonal_fullvoltage(args, datetime.date(2026, 6, 21))
+        summer = seasonal_fullvoltage(args, datetime.date(2026, 12, 21))
+        # darkest day -> near the winter bar, lightest day -> near summer
+        self.assertAlmostEqual(winter, 27.0, delta=0.05)
+        self.assertAlmostEqual(summer, 26.0, delta=0.05)
+        self.assertGreater(winter, summer)
+        # disabled (winter_fullvoltage falsy) -> static fullvoltage
+        off = namedtuple('args', ('fullvoltage', 'winter_fullvoltage', 'latitude'))
+        off.fullvoltage = 25.0
+        off.winter_fullvoltage = 0.0
+        off.latitude = -41.1
+        self.assertEqual(25.0, seasonal_fullvoltage(off, datetime.date(2026, 6, 21)))
 
     def test_flatten_telemetry(self):
         flat = flatten_telemetry(

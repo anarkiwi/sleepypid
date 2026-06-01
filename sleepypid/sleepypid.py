@@ -6,6 +6,7 @@ import argparse
 import copy
 import datetime
 import json
+import math
 import platform
 import random
 import statistics
@@ -184,14 +185,51 @@ def log_json(log, obj, prometheus=True):
     log_prometheus(prometheus, obj)
 
 
-def calc_soc(mean_v, args):
+def daylength_hours(day_of_year, latitude):
+    """Daylight hours for a day-of-year and latitude (Forsythe et al. 1995)."""
+    lat = math.radians(latitude)
+    theta = 0.2163108 + 2 * math.atan(
+        0.9671396 * math.tan(0.00860 * (day_of_year - 186)))
+    phi = math.asin(0.39795 * math.cos(theta))
+    p = 0.8333  # sun's apparent radius + refraction at sunrise/sunset
+    arg = ((math.sin(math.radians(p)) + math.sin(lat) * math.sin(phi)) /
+           (math.cos(lat) * math.cos(phi)))
+    arg = max(-1.0, min(1.0, arg))
+    return 24.0 - (24.0 / math.pi) * math.acos(arg)
+
+
+def seasonal_fullvoltage(args, when=None):
+    """Full-charge voltage scaled by photoperiod.
+
+    With args.winter_fullvoltage set, args.fullvoltage is the lightest-day
+    (summer) value and winter_fullvoltage the darkest-day value. The threshold
+    is interpolated by today's daylength between the local solstices: less light
+    -> higher threshold -> the battery reads as less full -> the Pi sleeps more.
+    Returns the static args.fullvoltage when winter_fullvoltage is unset.
+    """
+    winter = getattr(args, 'winter_fullvoltage', 0)
+    if not winter:
+        return args.fullvoltage
+    latitude = getattr(args, 'latitude', 0)
+    when = when or datetime.date.today()
+    daylengths = [daylength_hours(d, latitude) for d in range(1, 366)]
+    dmin, dmax = min(daylengths), max(daylengths)
+    today = daylength_hours(when.timetuple().tm_yday, latitude)
+    light = (today - dmin) / (dmax - dmin) if dmax > dmin else 1.0
+    light = max(0.0, min(1.0, light))
+    return winter + light * (args.fullvoltage - winter)
+
+
+def calc_soc(mean_v, args, fullvoltage=None):
     """Calculate battery SOC."""
     # TODO: consider discharge current.
-    if mean_v >= args.fullvoltage:
+    if fullvoltage is None:
+        fullvoltage = args.fullvoltage
+    if mean_v >= fullvoltage:
         return 100
     if mean_v <= args.shutdownvoltage:
         return 0
-    return (mean_v - args.shutdownvoltage) / (args.fullvoltage - args.shutdownvoltage) * 100
+    return (mean_v - args.shutdownvoltage) / (fullvoltage - args.shutdownvoltage) * 100
 
 
 def call_script(script, timeout=SHUTDOWN_TIMEOUT):
@@ -227,10 +265,12 @@ def loop(args):
                     if len(window_stats[stat]) > 1:
                         window_diffs[stat] = mean_diff(window_stats[stat])
                 if window_diffs and sample_count >= args.window_samples:
-                    soc = calc_soc(response[MEAN_V], args)
+                    fullvoltage = seasonal_fullvoltage(args)
+                    soc = calc_soc(response[MEAN_V], args, fullvoltage)
                     window_summary = {
                         'window_diffs': window_diffs,
                         'soc': soc,
+                        'fullvoltage': fullvoltage,
                     }
                     log_json(args.log, window_summary, args.prometheus)
 
@@ -278,7 +318,16 @@ def parse_args():
         help='current in mA at which the Pi is considered shutdown')
     parser.add_argument(
         '--fullvoltage', default=13.3, type=float,
-        help='voltage at which the battery is considered full')
+        help='voltage at which the battery is considered full (the '
+             'lightest-day value when --winter-fullvoltage is set)')
+    parser.add_argument(
+        '--winter-fullvoltage', default=0.0, type=float,
+        help='full voltage at the darkest day of the year; if set (>0), the '
+             'considered-full threshold is scaled by photoperiod between this '
+             'and --fullvoltage so the Pi sleeps more in the dark season')
+    parser.add_argument(
+        '--latitude', default=0.0, type=float,
+        help='site latitude in degrees (negative south) for --winter-fullvoltage')
     parser.add_argument(
         '--minsleepmins', default=MIN_SLEEP_MINS, type=float,
         help='minimum time to sleep')
@@ -307,6 +356,8 @@ def parse_args():
     main_args = parser.parse_args()
     assert main_args.shutdownvoltage > main_args.deepsleepvoltage
     assert main_args.fullvoltage > main_args.shutdownvoltage
+    if main_args.winter_fullvoltage:
+        assert main_args.winter_fullvoltage > main_args.fullvoltage
     return main_args
 
 
