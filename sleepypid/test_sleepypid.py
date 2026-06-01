@@ -5,7 +5,10 @@ import os
 import tempfile
 import unittest
 from collections import namedtuple
-from sleepypid import get_uptime, mean_diff, sleep_duty_seconds, calc_soc, log_grafana, call_script, parse_args, override_args
+from prometheus_client import REGISTRY
+from sleepypid import (
+    get_uptime, mean_diff, sleep_duty_seconds, calc_soc, flatten_telemetry,
+    log_prometheus, call_script, parse_args, override_args)
 
 
 class SleepyidTestCase(unittest.TestCase):
@@ -29,18 +32,47 @@ class SleepyidTestCase(unittest.TestCase):
         self.assertEqual(0, calc_soc(12.8, args))
         self.assertAlmostEqual(50, calc_soc(13.1, args), places=2)
 
-    def test_log_grafana(self):
-        with tempfile.TemporaryDirectory() as test_dir:
-            log_grafana(True, test_dir,
-                {"command": {"command": "sensors"},
-                 "response": {"command": "sensors", "error": "", "rpiCurrent": 1, "supplyVoltage": 1, "mean1mSupplyVoltage": 1,
-                              "mean1mRpiCurrent": 1, "min1mSupplyVoltage": 1, "min1mRpiCurrent": 1, "max1mSupplyVoltage": 1,
-                              "max1mRpiCurrent": 1, "meanValid": True, "powerState": True, "powerStateOverride": False, "uptimems": 1},
-                              "timestamp": 1, "utctimestamp": "2021-01-01 01:11:11.11",
-                              "loadavg": [1, 1, 1], "uptime": 1, "cputempc": 5}, True)
-            log_grafana(True, test_dir,
-                {"window_diffs": {"mean1mRpiCurrent": 0.1, "mean1mSupplyVoltage": -0.01, "cputempc": 0.01}, "soc": 100, "timestamp": 1,
-                                  "utctimestamp": "2021-01-01 01:11:11.11", "loadavg": [1, 1, 1], "uptime": 1, "cputempc": 5}, True)
+    def test_flatten_telemetry(self):
+        flat = flatten_telemetry(
+            {"command": {"command": "sensors"},
+             "response": {"command": "sensors", "error": "", "rpiCurrent": 1,
+                          "supplyVoltage": 2, "meanValid": True},
+             "loadavg": [1, 2, 3], "window_diffs": {"cputempc": 0.01}})
+        # response keys hoisted to the top level
+        self.assertEqual(1, flat["rpiCurrent"])
+        self.assertEqual(2, flat["supplyVoltage"])
+        self.assertNotIn("response", flat)
+        # loadavg tuple expanded into per-window keys
+        self.assertEqual(1, flat["loadavg1m"])
+        self.assertEqual(3, flat["loadavg15m"])
+        self.assertNotIn("loadavg", flat)
+        # window_diffs flattened with a suffix
+        self.assertEqual(0.01, flat["cputempc_window_diffs"])
+        self.assertNotIn("window_diffs", flat)
+
+    def test_log_prometheus(self):
+        log_prometheus(False, {"soc": 42})
+        self.assertIsNone(REGISTRY.get_sample_value("sleepypi_soc"))
+        log_prometheus(True,
+            {"command": {"command": "sensors"},
+             "response": {"command": "sensors", "error": "", "rpiCurrent": 1, "supplyVoltage": 1, "mean1mSupplyVoltage": 1,
+                          "mean1mRpiCurrent": 1, "min1mSupplyVoltage": 1, "min1mRpiCurrent": 1, "max1mSupplyVoltage": 1,
+                          "max1mRpiCurrent": 1, "meanValid": True, "powerState": True, "powerStateOverride": False, "uptimems": 1},
+                          "timestamp": 1, "utctimestamp": "2021-01-01 01:11:11.11",
+                          "loadavg": [1, 1, 1], "uptime": 1, "cputempc": 5})
+        log_prometheus(True,
+            {"window_diffs": {"mean1mRpiCurrent": 0.1, "mean1mSupplyVoltage": -0.01, "cputempc": 0.01}, "soc": 100, "timestamp": 1,
+                              "utctimestamp": "2021-01-01 01:11:11.11", "loadavg": [1, 1, 1], "uptime": 1, "cputempc": 5})
+        # numeric sensor values are exported as gauges
+        self.assertEqual(1, REGISTRY.get_sample_value("sleepypi_mean1mSupplyVoltage"))
+        # booleans are coerced to 0/1
+        self.assertEqual(1, REGISTRY.get_sample_value("sleepypi_powerState"))
+        self.assertEqual(0, REGISTRY.get_sample_value("sleepypi_powerStateOverride"))
+        # window diffs and derived values are exported
+        self.assertEqual(100, REGISTRY.get_sample_value("sleepypi_soc"))
+        self.assertAlmostEqual(0.01, REGISTRY.get_sample_value("sleepypi_cputempc_window_diffs"))
+        # non-numeric values (strings/dicts) are not exported
+        self.assertIsNone(REGISTRY.get_sample_value("sleepypi_utctimestamp"))
 
     def test_mean_diff(self):
         self.assertEqual(0, mean_diff([0, 1, 2, 3, 4, 3, 2, 1, 0]))

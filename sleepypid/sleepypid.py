@@ -8,7 +8,6 @@ import datetime
 import json
 import platform
 import random
-import socket
 import statistics
 import subprocess
 import sys
@@ -16,13 +15,15 @@ import time
 import os
 from collections import defaultdict
 import serial
+from prometheus_client import Gauge, start_http_server
 
 MIN_SLEEP_MINS = 15
 MAX_SLEEP_MINS = (6 * 60) - MIN_SLEEP_MINS
 MEAN_V = 'mean1mSupplyVoltage'
 MEAN_C = 'mean1mRpiCurrent'
 SHUTDOWN_TIMEOUT = 60
-sensor_data = {}
+PROMETHEUS_PREFIX = 'sleepypi_'
+prometheus_gauges = {}
 
 
 class SerialException(Exception):
@@ -84,7 +85,7 @@ def send_command(command, args):
         summary['response'] = json.loads(response_bytes.decode())
         command_error = summary['response'].get('error', None)
 
-    log_json(args.log, args.grafana, args.grafana_path, summary)
+    log_json(args.log, summary, args.prometheus)
     return (summary, command_error)
 
 
@@ -120,47 +121,44 @@ def configure_sleepypi(args):
                 sys.exit(-1)
 
 
-def log_grafana(grafana, grafana_path, obj, write_results):
-    """Log grafana telemetry."""
-    global sensor_data
+def flatten_telemetry(obj):
+    """Flatten a nested telemetry object into scalar key/value pairs."""
+    flat = copy.copy(obj)
+    if "loadavg" in flat:
+        m1, m5, m15 = flat.pop("loadavg")
+        flat["loadavg1m"] = m1
+        flat["loadavg5m"] = m5
+        flat["loadavg15m"] = m15
+    response = flat.get("response")
+    if isinstance(response, dict) and response.get("command") == "sensors":
+        for key, value in response.items():
+            flat[key] = value
+        del flat["response"]
+    if "window_diffs" in flat:
+        for key, value in flat.pop("window_diffs").items():
+            flat[key + "_window_diffs"] = value
+    return flat
 
-    if not grafana:
+
+def log_prometheus(prometheus, obj):
+    """Update Prometheus gauges from a telemetry object."""
+    if not prometheus:
         return
-    grafana_obj = copy.copy(obj)
-    timestamp = int(time.time()*1000)
-    if "loadavg" in grafana_obj:
-        loadavg = grafana_obj["loadavg"]
-        del grafana_obj["loadavg"]
-        m1, m5, m15 = loadavg
-        grafana_obj["loadavg1m"] = m1
-        grafana_obj["loadavg5m"] = m5
-        grafana_obj["loadavg15m"] = m15
-    if ("response" in grafana_obj and
-            "command" in grafana_obj["response"] and
-            grafana_obj["response"]["command"] == "sensors"):
-        for key in grafana_obj["response"]:
-            grafana_obj[key] = grafana_obj["response"][key]
-        del grafana_obj["response"]
-    if "window_diffs" in grafana_obj:
-        for key in grafana_obj["window_diffs"]:
-            grafana_obj[key+"_window_diffs"] = grafana_obj["window_diffs"][key]
-        del grafana_obj["window_diffs"]
-    for key in grafana_obj.keys():
-        if key in sensor_data:
-            sensor_data[key].append([grafana_obj[key], timestamp])
-        else:
-            sensor_data[key] = [[grafana_obj[key], timestamp]]
-    if write_results:
-        hostname = socket.gethostname()
-        os.makedirs(grafana_path, exist_ok=True)
-        with open(f'{grafana_path}/{hostname}-{timestamp}-sleepypi.json', 'w', encoding='utf-8') as f:
-            for k, v in sensor_data.items():
-                record = {"target": k, "datapoints": v}
-                f.write(f'{json.dumps(record)}\n')
-        sensor_data = {}
+    for key, value in flatten_telemetry(obj).items():
+        if isinstance(value, bool):
+            value = int(value)
+        elif not isinstance(value, (int, float)):
+            continue
+        gauge = prometheus_gauges.get(key)
+        if gauge is None:
+            gauge = Gauge(
+                "%s%s" % (PROMETHEUS_PREFIX, key),
+                "sleepypi telemetry %s" % key)
+            prometheus_gauges[key] = gauge
+        gauge.set(value)
 
 
-def log_json(log, grafana, grafana_path, obj, rollover=900, iterations=0):
+def log_json(log, obj, prometheus=True):
     """Log JSON object."""
 
     if os.path.isdir(log):
@@ -182,11 +180,7 @@ def log_json(log, grafana, grafana_path, obj, rollover=900, iterations=0):
     with open(log_path, 'a', encoding='utf-8') as logfile:
         logfile.write(json.dumps(obj) + '\n')
 
-    write_results = False
-    # wait for a rollover or a snooze command to write out results
-    if (iterations != 0 and iterations % rollover == 0) or ('command' in obj and 'command' in obj['command'] and 'snooze' in obj['command']['command']):
-        write_results = True
-    log_grafana(grafana, grafana_path, obj, write_results)
+    log_prometheus(prometheus, obj)
 
 
 def calc_soc(mean_v, args):
@@ -237,13 +231,12 @@ def loop(args):
                         'window_diffs': window_diffs,
                         'soc': soc,
                     }
-                    log_json(args.log, args.grafana, args.grafana_path, window_summary, args.window_samples*60, args.polltime*ticker)
+                    log_json(args.log, window_summary, args.prometheus)
 
                     if args.sleepscript and (sample_count % args.window_samples == 0):
                         duration = sleep_duty_seconds(soc, args.minsleepmins, args.maxsleepmins)
                         if duration:
                             send_command({'command': 'snooze', 'duration': duration}, args)
-                            log_grafana(args.grafana, args.grafana_path, window_summary, True)
                             call_script(args.sleepscript)
                             sys.exit(0)
 
@@ -299,14 +292,14 @@ def parse_args():
     parser.add_argument('--startscript', default='',
         help='script to run on startup')
     parser.add_argument(
-        '--grafana-path', default='/flash/telemetry/sensors',
-        help='directory to write out JSON files for Grafana, only enabled if Grafana is enabled')
-    parser.add_argument(
         '--argjson', default='',
         help='file with JSON to override arguments')
-    parser.add_argument('--grafana', dest='grafana', action='store_true')
-    parser.add_argument('--no-grafana', dest='grafana', action='store_false')
-    parser.set_defaults(grafana=True)
+    parser.add_argument(
+        '--prometheus-port', default=9110, type=int,
+        help='port to expose Prometheus metrics on')
+    parser.add_argument('--prometheus', dest='prometheus', action='store_true')
+    parser.add_argument('--no-prometheus', dest='prometheus', action='store_false')
+    parser.set_defaults(prometheus=True)
     main_args = parser.parse_args()
     assert main_args.shutdownvoltage > main_args.deepsleepvoltage
     assert main_args.fullvoltage > main_args.shutdownvoltage
@@ -326,6 +319,8 @@ def override_args(main_args):
 if __name__ == '__main__':
     main_args = parse_args()
     main_args = override_args(main_args)
+    if main_args.prometheus:
+        start_http_server(main_args.prometheus_port)
     if main_args.startscript:
         call_script(main_args.startscript)
     configure_sleepypi(main_args)
