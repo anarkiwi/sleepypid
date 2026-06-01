@@ -10,3 +10,26 @@
 8. In the IDE, on the opened `sleepypi.ino` file, first "Verify" (check mark icon), and assuming that succeeds, proceed to "Upload" (right arrow icon)
 9. You should see JSON info coming in on the serial monitor and the board should start blinking
 10. Pull USB cables, remove programming board, and deploy your freshly flashed SleepyPi
+
+# sleepypid daemon
+
+`sleepypid/sleepypid.py` polls the SleepyPi hat over serial, manages sleep/wake
+duty cycling, and logs telemetry.
+
+## Prometheus metrics
+
+By default the daemon exposes its current sensor values and derived state as
+Prometheus gauges on port `9110` (override with `--prometheus-port`, disable
+with `--no-prometheus`). Point a Prometheus scrape at `http://<host>:9110/metrics`
+instead of parsing the log file. All metrics are prefixed `sleepypi_`, e.g.
+`sleepypi_mean1mSupplyVoltage`, `sleepypi_mean1mRpiCurrent`, `sleepypi_soc`,
+`sleepypi_powerState`, and `sleepypi_cputempc`.
+
+## Running the tests
+
+Tests and lint run inside Docker:
+
+```
+docker build --target test .
+```
+

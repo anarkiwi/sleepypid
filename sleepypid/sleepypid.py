@@ -6,9 +6,9 @@ import argparse
 import copy
 import datetime
 import json
+import math
 import platform
 import random
-import socket
 import statistics
 import subprocess
 import sys
@@ -16,13 +16,16 @@ import time
 import os
 from collections import defaultdict
 import serial
+from prometheus_client import Gauge, start_http_server
 
 MIN_SLEEP_MINS = 15
 MAX_SLEEP_MINS = (6 * 60) - MIN_SLEEP_MINS
 MEAN_V = 'mean1mSupplyVoltage'
 MEAN_C = 'mean1mRpiCurrent'
 SHUTDOWN_TIMEOUT = 60
-sensor_data = {}
+PROMETHEUS_PREFIX = 'sleepypi_'
+prometheus_prefix = PROMETHEUS_PREFIX
+prometheus_gauges = {}
 
 
 class SerialException(Exception):
@@ -84,7 +87,7 @@ def send_command(command, args):
         summary['response'] = json.loads(response_bytes.decode())
         command_error = summary['response'].get('error', None)
 
-    log_json(args.log, args.grafana, args.grafana_path, summary)
+    log_json(args.log, summary, args.prometheus)
     return (summary, command_error)
 
 
@@ -120,47 +123,44 @@ def configure_sleepypi(args):
                 sys.exit(-1)
 
 
-def log_grafana(grafana, grafana_path, obj, write_results):
-    """Log grafana telemetry."""
-    global sensor_data
+def flatten_telemetry(obj):
+    """Flatten a nested telemetry object into scalar key/value pairs."""
+    flat = copy.copy(obj)
+    if "loadavg" in flat:
+        m1, m5, m15 = flat.pop("loadavg")
+        flat["loadavg1m"] = m1
+        flat["loadavg5m"] = m5
+        flat["loadavg15m"] = m15
+    response = flat.get("response")
+    if isinstance(response, dict) and response.get("command") == "sensors":
+        for key, value in response.items():
+            flat[key] = value
+        del flat["response"]
+    if "window_diffs" in flat:
+        for key, value in flat.pop("window_diffs").items():
+            flat[key + "_window_diffs"] = value
+    return flat
 
-    if not grafana:
+
+def log_prometheus(prometheus, obj):
+    """Update Prometheus gauges from a telemetry object."""
+    if not prometheus:
         return
-    grafana_obj = copy.copy(obj)
-    timestamp = int(time.time()*1000)
-    if "loadavg" in grafana_obj:
-        loadavg = grafana_obj["loadavg"]
-        del grafana_obj["loadavg"]
-        m1, m5, m15 = loadavg
-        grafana_obj["loadavg1m"] = m1
-        grafana_obj["loadavg5m"] = m5
-        grafana_obj["loadavg15m"] = m15
-    if ("response" in grafana_obj and
-            "command" in grafana_obj["response"] and
-            grafana_obj["response"]["command"] == "sensors"):
-        for key in grafana_obj["response"]:
-            grafana_obj[key] = grafana_obj["response"][key]
-        del grafana_obj["response"]
-    if "window_diffs" in grafana_obj:
-        for key in grafana_obj["window_diffs"]:
-            grafana_obj[key+"_window_diffs"] = grafana_obj["window_diffs"][key]
-        del grafana_obj["window_diffs"]
-    for key in grafana_obj.keys():
-        if key in sensor_data:
-            sensor_data[key].append([grafana_obj[key], timestamp])
-        else:
-            sensor_data[key] = [[grafana_obj[key], timestamp]]
-    if write_results:
-        hostname = socket.gethostname()
-        os.makedirs(grafana_path, exist_ok=True)
-        with open(f'{grafana_path}/{hostname}-{timestamp}-sleepypi.json', 'w', encoding='utf-8') as f:
-            for k, v in sensor_data.items():
-                record = {"target": k, "datapoints": v}
-                f.write(f'{json.dumps(record)}\n')
-        sensor_data = {}
+    for key, value in flatten_telemetry(obj).items():
+        if isinstance(value, bool):
+            value = int(value)
+        elif not isinstance(value, (int, float)):
+            continue
+        gauge = prometheus_gauges.get(key)
+        if gauge is None:
+            gauge = Gauge(
+                "%s%s" % (prometheus_prefix, key),
+                "sleepypi telemetry %s" % key)
+            prometheus_gauges[key] = gauge
+        gauge.set(value)
 
 
-def log_json(log, grafana, grafana_path, obj, rollover=900, iterations=0):
+def log_json(log, obj, prometheus=True):
     """Log JSON object."""
 
     if os.path.isdir(log):
@@ -182,21 +182,54 @@ def log_json(log, grafana, grafana_path, obj, rollover=900, iterations=0):
     with open(log_path, 'a', encoding='utf-8') as logfile:
         logfile.write(json.dumps(obj) + '\n')
 
-    write_results = False
-    # wait for a rollover or a snooze command to write out results
-    if (iterations != 0 and iterations % rollover == 0) or ('command' in obj and 'command' in obj['command'] and 'snooze' in obj['command']['command']):
-        write_results = True
-    log_grafana(grafana, grafana_path, obj, write_results)
+    log_prometheus(prometheus, obj)
 
 
-def calc_soc(mean_v, args):
+def daylength_hours(day_of_year, latitude):
+    """Daylight hours for a day-of-year and latitude (Forsythe et al. 1995)."""
+    lat = math.radians(latitude)
+    theta = 0.2163108 + 2 * math.atan(
+        0.9671396 * math.tan(0.00860 * (day_of_year - 186)))
+    phi = math.asin(0.39795 * math.cos(theta))
+    p = 0.8333  # sun's apparent radius + refraction at sunrise/sunset
+    arg = ((math.sin(math.radians(p)) + math.sin(lat) * math.sin(phi)) /
+           (math.cos(lat) * math.cos(phi)))
+    arg = max(-1.0, min(1.0, arg))
+    return 24.0 - (24.0 / math.pi) * math.acos(arg)
+
+
+def seasonal_fullvoltage(args, when=None):
+    """Full-charge voltage scaled by photoperiod.
+
+    With args.winter_fullvoltage set, args.fullvoltage is the lightest-day
+    (summer) value and winter_fullvoltage the darkest-day value. The threshold
+    is interpolated by today's daylength between the local solstices: less light
+    -> higher threshold -> the battery reads as less full -> the Pi sleeps more.
+    Returns the static args.fullvoltage when winter_fullvoltage is unset.
+    """
+    winter = getattr(args, 'winter_fullvoltage', 0)
+    if not winter:
+        return args.fullvoltage
+    latitude = getattr(args, 'latitude', 0)
+    when = when or datetime.date.today()
+    daylengths = [daylength_hours(d, latitude) for d in range(1, 366)]
+    dmin, dmax = min(daylengths), max(daylengths)
+    today = daylength_hours(when.timetuple().tm_yday, latitude)
+    light = (today - dmin) / (dmax - dmin) if dmax > dmin else 1.0
+    light = max(0.0, min(1.0, light))
+    return winter + light * (args.fullvoltage - winter)
+
+
+def calc_soc(mean_v, args, fullvoltage=None):
     """Calculate battery SOC."""
     # TODO: consider discharge current.
-    if mean_v >= args.fullvoltage:
+    if fullvoltage is None:
+        fullvoltage = args.fullvoltage
+    if mean_v >= fullvoltage:
         return 100
     if mean_v <= args.shutdownvoltage:
         return 0
-    return (mean_v - args.shutdownvoltage) / (args.fullvoltage - args.shutdownvoltage) * 100
+    return (mean_v - args.shutdownvoltage) / (fullvoltage - args.shutdownvoltage) * 100
 
 
 def call_script(script, timeout=SHUTDOWN_TIMEOUT):
@@ -232,18 +265,19 @@ def loop(args):
                     if len(window_stats[stat]) > 1:
                         window_diffs[stat] = mean_diff(window_stats[stat])
                 if window_diffs and sample_count >= args.window_samples:
-                    soc = calc_soc(response[MEAN_V], args)
+                    fullvoltage = seasonal_fullvoltage(args)
+                    soc = calc_soc(response[MEAN_V], args, fullvoltage)
                     window_summary = {
                         'window_diffs': window_diffs,
                         'soc': soc,
+                        'fullvoltage': fullvoltage,
                     }
-                    log_json(args.log, args.grafana, args.grafana_path, window_summary, args.window_samples*60, args.polltime*ticker)
+                    log_json(args.log, window_summary, args.prometheus)
 
                     if args.sleepscript and (sample_count % args.window_samples == 0):
                         duration = sleep_duty_seconds(soc, args.minsleepmins, args.maxsleepmins)
                         if duration:
                             send_command({'command': 'snooze', 'duration': duration}, args)
-                            log_grafana(args.grafana, args.grafana_path, window_summary, True)
                             call_script(args.sleepscript)
                             sys.exit(0)
 
@@ -284,7 +318,16 @@ def parse_args():
         help='current in mA at which the Pi is considered shutdown')
     parser.add_argument(
         '--fullvoltage', default=13.3, type=float,
-        help='voltage at which the battery is considered full')
+        help='voltage at which the battery is considered full (the '
+             'lightest-day value when --winter-fullvoltage is set)')
+    parser.add_argument(
+        '--winter-fullvoltage', default=0.0, type=float,
+        help='full voltage at the darkest day of the year; if set (>0), the '
+             'considered-full threshold is scaled by photoperiod between this '
+             'and --fullvoltage so the Pi sleeps more in the dark season')
+    parser.add_argument(
+        '--latitude', default=0.0, type=float,
+        help='site latitude in degrees (negative south) for --winter-fullvoltage')
     parser.add_argument(
         '--minsleepmins', default=MIN_SLEEP_MINS, type=float,
         help='minimum time to sleep')
@@ -299,17 +342,22 @@ def parse_args():
     parser.add_argument('--startscript', default='',
         help='script to run on startup')
     parser.add_argument(
-        '--grafana-path', default='/flash/telemetry/sensors',
-        help='directory to write out JSON files for Grafana, only enabled if Grafana is enabled')
-    parser.add_argument(
         '--argjson', default='',
         help='file with JSON to override arguments')
-    parser.add_argument('--grafana', dest='grafana', action='store_true')
-    parser.add_argument('--no-grafana', dest='grafana', action='store_false')
-    parser.set_defaults(grafana=True)
+    parser.add_argument(
+        '--prometheus-port', default=9110, type=int,
+        help='port to expose Prometheus metrics on')
+    parser.add_argument(
+        '--prometheus-prefix', default=PROMETHEUS_PREFIX,
+        help='prefix for exported Prometheus metric names (set empty for bare names)')
+    parser.add_argument('--prometheus', dest='prometheus', action='store_true')
+    parser.add_argument('--no-prometheus', dest='prometheus', action='store_false')
+    parser.set_defaults(prometheus=True)
     main_args = parser.parse_args()
     assert main_args.shutdownvoltage > main_args.deepsleepvoltage
     assert main_args.fullvoltage > main_args.shutdownvoltage
+    if main_args.winter_fullvoltage:
+        assert main_args.winter_fullvoltage > main_args.fullvoltage
     return main_args
 
 
@@ -326,6 +374,9 @@ def override_args(main_args):
 if __name__ == '__main__':
     main_args = parse_args()
     main_args = override_args(main_args)
+    if main_args.prometheus:
+        prometheus_prefix = main_args.prometheus_prefix
+        start_http_server(main_args.prometheus_port)
     if main_args.startscript:
         call_script(main_args.startscript)
     configure_sleepypi(main_args)

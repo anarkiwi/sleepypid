@@ -1,0 +1,12 @@
+name: python-test
+on: [push, pull_request]
+jobs:
+  docker-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build and test in Docker
+        run: docker build --target test -t sleepypid-test .
+      - name: Build runtime image
+        run: docker build --target runtime -t sleepypid .

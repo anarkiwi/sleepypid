@@ -8,10 +8,8 @@ jobs:
         uses: actions/checkout@v6
       - name: Install
         run: |
-          sudo apt-get update && sudo apt-get -qyf install wget unzip python3-dev
-          pip3 install -r requirements.txt
-          PYTHONPATH=sleepypid ./sleepypid/test_sleepypid.py
-          wget -O/tmp/ide.zip https://downloads.arduino.cc/arduino-ide/arduino-ide_2.1.0_Linux_64bit.zip
+          sudo apt-get update && sudo apt-get -qyf install wget unzip
+          wget -O/tmp/ide.zip https://downloads.arduino.cc/arduino-ide/arduino-ide_2.3.2_Linux_64bit.zip
           unzip /tmp/ide.zip
           find arduino-ide* -name python3 -exec ln -sf $(which python3) {} \;
           mkdir ~/bin
