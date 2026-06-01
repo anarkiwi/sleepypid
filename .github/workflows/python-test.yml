@@ -5,7 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Build and test in Docker
         run: docker build --target test -t sleepypid-test .
       - name: Build runtime image
