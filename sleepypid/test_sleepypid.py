@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from collections import namedtuple
 from prometheus_client import REGISTRY
+import sleepypid
 from sleepypid import (
     get_uptime, mean_diff, sleep_duty_seconds, calc_soc, flatten_telemetry,
     log_prometheus, call_script, parse_args, override_args)
@@ -73,6 +74,22 @@ class SleepyidTestCase(unittest.TestCase):
         self.assertAlmostEqual(0.01, REGISTRY.get_sample_value("sleepypi_cputempc_window_diffs"))
         # non-numeric values (strings/dicts) are not exported
         self.assertIsNone(REGISTRY.get_sample_value("sleepypi_utctimestamp"))
+
+    def test_prometheus_prefix_empty(self):
+        # an empty prefix exports bare metric names for drop-in compatibility
+        # with the legacy pushgateway series (e.g. ridge-pi deployment).
+        original_prefix = sleepypid.prometheus_prefix
+        sleepypid.prometheus_prefix = ''
+        try:
+            log_prometheus(True, {"window_diffs": {}, "legacyBareMetric": 7})
+        finally:
+            sleepypid.prometheus_prefix = original_prefix
+        self.assertEqual(7, REGISTRY.get_sample_value("legacyBareMetric"))
+        self.assertIsNone(REGISTRY.get_sample_value("sleepypi_legacyBareMetric"))
+
+    def test_prometheus_prefix_arg(self):
+        args = parse_args()
+        self.assertEqual('sleepypi_', args.prometheus_prefix)
 
     def test_mean_diff(self):
         self.assertEqual(0, mean_diff([0, 1, 2, 3, 4, 3, 2, 1, 0]))

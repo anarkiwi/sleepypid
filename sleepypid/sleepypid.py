@@ -23,6 +23,7 @@ MEAN_V = 'mean1mSupplyVoltage'
 MEAN_C = 'mean1mRpiCurrent'
 SHUTDOWN_TIMEOUT = 60
 PROMETHEUS_PREFIX = 'sleepypi_'
+prometheus_prefix = PROMETHEUS_PREFIX
 prometheus_gauges = {}
 
 
@@ -152,7 +153,7 @@ def log_prometheus(prometheus, obj):
         gauge = prometheus_gauges.get(key)
         if gauge is None:
             gauge = Gauge(
-                "%s%s" % (PROMETHEUS_PREFIX, key),
+                "%s%s" % (prometheus_prefix, key),
                 "sleepypi telemetry %s" % key)
             prometheus_gauges[key] = gauge
         gauge.set(value)
@@ -297,6 +298,9 @@ def parse_args():
     parser.add_argument(
         '--prometheus-port', default=9110, type=int,
         help='port to expose Prometheus metrics on')
+    parser.add_argument(
+        '--prometheus-prefix', default=PROMETHEUS_PREFIX,
+        help='prefix for exported Prometheus metric names (set empty for bare names)')
     parser.add_argument('--prometheus', dest='prometheus', action='store_true')
     parser.add_argument('--no-prometheus', dest='prometheus', action='store_false')
     parser.set_defaults(prometheus=True)
@@ -320,6 +324,7 @@ if __name__ == '__main__':
     main_args = parse_args()
     main_args = override_args(main_args)
     if main_args.prometheus:
+        prometheus_prefix = main_args.prometheus_prefix
         start_http_server(main_args.prometheus_port)
     if main_args.startscript:
         call_script(main_args.startscript)
