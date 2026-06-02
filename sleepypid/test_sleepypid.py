@@ -6,12 +6,15 @@ import os
 import tempfile
 import unittest
 from collections import namedtuple
+from types import SimpleNamespace
 from prometheus_client import REGISTRY
 import sleepypid
 from sleepypid import (
     get_uptime, mean_diff, sleep_duty_seconds, calc_soc, flatten_telemetry,
     log_prometheus, call_script, parse_args, override_args,
-    daylength_hours, seasonal_fullvoltage)
+    daylength_hours, seasonal_fullvoltage,
+    extraterrestrial_radiation, clearsky_radiation, forecast_light_factor,
+    parse_open_meteo, parse_metservice, effective_fullvoltage, update_forecast)
 
 
 class SleepyidTestCase(unittest.TestCase):
@@ -75,6 +78,125 @@ class SleepyidTestCase(unittest.TestCase):
         off.winter_fullvoltage = 0.0
         off.latitude = -41.1
         self.assertEqual(25.0, seasonal_fullvoltage(off, datetime.date(2026, 6, 21)))
+
+    def test_extraterrestrial_radiation(self):
+        # FAO-56 Example 8: 3 September (day 246) at 20 S -> Ra ~ 32.2 MJ/m^2
+        self.assertAlmostEqual(32.2, extraterrestrial_radiation(246, -20.0), delta=0.3)
+        # clear-sky surface reference is 0.75 * Ra
+        self.assertAlmostEqual(
+            0.75 * extraterrestrial_radiation(246, -20.0),
+            clearsky_radiation(246, -20.0), places=5)
+
+    def test_forecast_light_factor(self):
+        when = datetime.date(2026, 6, 21)
+        lat = -41.102223
+        clearsky = clearsky_radiation(when.timetuple().tm_yday, lat)
+        # a clear forecast (~ clear-sky energy) -> full light, no extra sleep
+        self.assertGreater(forecast_light_factor([clearsky] * 3, when, lat), 0.95)
+        # heavily clouded forecast -> little light -> sleepier
+        self.assertAlmostEqual(
+            0.2, forecast_light_factor([clearsky * 0.2] * 3, when, lat), delta=0.05)
+        # a missing day counts as zero (err sleepy); empty -> neutral 1.0
+        self.assertAlmostEqual(
+            0.5, forecast_light_factor([None, clearsky], when, lat), delta=0.05)
+        self.assertEqual(1.0, forecast_light_factor([], when, lat))
+
+    def test_effective_fullvoltage(self):
+        args = SimpleNamespace(
+            fullvoltage=26.0, winter_fullvoltage=0.0, latitude=-41.1,
+            forecast_fullvoltage_span=0.5)
+        when = datetime.date(2026, 6, 21)
+        # factor 1.0 (clear) -> seasonal value unchanged
+        self.assertAlmostEqual(26.0, effective_fullvoltage(args, 1.0, when), places=5)
+        # factor 0.0 (dark) -> seasonal + full span -> sleepier
+        self.assertAlmostEqual(26.5, effective_fullvoltage(args, 0.0, when), places=5)
+        self.assertAlmostEqual(26.25, effective_fullvoltage(args, 0.5, when), places=5)
+        # span 0 disables the forecast bump entirely
+        args.forecast_fullvoltage_span = 0.0
+        self.assertAlmostEqual(26.0, effective_fullvoltage(args, 0.0, when), places=5)
+
+    def test_parse_open_meteo(self):
+        payload = {"daily": {"time": ["2026-06-02", "2026-06-03", "2026-06-04"],
+                             "shortwave_radiation_sum": [6.0, 4.5, None]}}
+        self.assertEqual([6.0, 4.5, None], parse_open_meteo(payload))
+
+    def test_parse_metservice(self):
+        # hourly W/m^2 integrated to MJ/m^2 per UTC day; noData filtered out
+        payload = {
+            "noData": -9999.0,
+            "dimensions": {"time": {"data": [0, 3600, 7200]}},
+            "variables": {"radiation.shortwave": {"data": [100.0, 200.0, -9999.0]}},
+        }
+        # (100 + 200) W/m^2 * 3600 s / 1e6 = 1.08 MJ/m^2 for 1970-01-01
+        self.assertEqual(1, len(parse_metservice(payload)))
+        self.assertAlmostEqual(1.08, parse_metservice(payload)[0], places=5)
+
+    def _forecast_args(self, cache_path):
+        return SimpleNamespace(
+            forecast_cache=cache_path, forecast_refresh_hours=6.0,
+            forecast_max_age_hours=48.0, forecast_provider='open-meteo',
+            latitude=-41.102223, longitude=174.8, forecast_days=3)
+
+    def test_update_forecast_live(self):
+        now = 1700000000
+        payload = {"daily": {"time": ["a", "b", "c"],
+                             "shortwave_radiation_sum": [1.0, 1.0, 1.0]}}
+        with tempfile.TemporaryDirectory() as test_dir:
+            args = self._forecast_args(os.path.join(test_dir, 'forecast.json'))
+            factor, status = update_forecast(
+                args, now=now, fetcher=lambda a: payload)
+            when = datetime.datetime.fromtimestamp(
+                now, datetime.timezone.utc).date()
+            self.assertAlmostEqual(
+                forecast_light_factor([1.0, 1.0, 1.0], when, args.latitude), factor)
+            self.assertEqual(1, status['forecast_fetch_ok'])
+            self.assertEqual(0, status['forecast_fetch_error'])
+            self.assertEqual(1, status['forecast_source_open_meteo'])
+            self.assertEqual(0, status['forecast_errors_open_meteo'])
+            self.assertTrue(os.path.exists(args.forecast_cache))
+
+    def _write_cache(self, path, **kwargs):
+        with open(path, 'w', encoding='utf-8') as cache:
+            cache.write(json.dumps(kwargs))
+
+    def _boom(self, _args):
+        raise OSError('forecast unreachable')
+
+    def test_update_forecast_fresh_cache(self):
+        now = 1700000000
+        with tempfile.TemporaryDirectory() as test_dir:
+            args = self._forecast_args(os.path.join(test_dir, 'forecast.json'))
+            self._write_cache(args.forecast_cache, ts=now, factor=0.3, errors={})
+            # fresh cache -> reused without calling the (raising) fetcher
+            factor, status = update_forecast(args, now=now, fetcher=self._boom)
+            self.assertEqual(0.3, factor)
+            self.assertEqual(0, status['forecast_fetch_error'])
+
+    def test_update_forecast_stale_cache_held(self):
+        now = 1700000000
+        with tempfile.TemporaryDirectory() as test_dir:
+            args = self._forecast_args(os.path.join(test_dir, 'forecast.json'))
+            # older than refresh (6h) but within max-age (48h) -> hold last value
+            self._write_cache(
+                args.forecast_cache, ts=now - 10 * 3600, factor=0.4, errors={})
+            factor, status = update_forecast(args, now=now, fetcher=self._boom)
+            self.assertEqual(0.4, factor)
+            self.assertEqual(1, status['forecast_fetch_error'])
+            # the failure is counted and persisted for Prometheus
+            self.assertEqual(1, status['forecast_errors_open_meteo'])
+            with open(args.forecast_cache, encoding='utf-8') as cache:
+                self.assertEqual(1, json.loads(cache.read())['errors']['open-meteo'])
+
+    def test_update_forecast_expired_cache_neutral(self):
+        now = 1700000000
+        with tempfile.TemporaryDirectory() as test_dir:
+            args = self._forecast_args(os.path.join(test_dir, 'forecast.json'))
+            # older than max-age -> revert to seasonal-neutral (factor 1.0)
+            self._write_cache(
+                args.forecast_cache, ts=now - 100 * 3600, factor=0.4, errors={})
+            factor, status = update_forecast(args, now=now, fetcher=self._boom)
+            self.assertEqual(1.0, factor)
+            self.assertEqual(1, status['forecast_fetch_error'])
 
     def test_flatten_telemetry(self):
         flat = flatten_telemetry(
