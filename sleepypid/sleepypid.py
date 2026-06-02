@@ -292,6 +292,10 @@ def parse_metservice(payload):
 
     Integrates the hourly radiation.shortwave flux (W/m^2) over each UTC day:
     W/m^2 sustained for one hour is W/m^2 * 3600 s = J/m^2, /1e6 -> MJ/m^2.
+
+    NOTE: coded against the documented CF-JSON shape but UNVERIFIED against a
+    live response (MetService is a paid plan). Confirm the field layout before
+    relying on it; only this parser and forecast_request should need changing.
     """
     dims = payload.get('dimensions', {})
     times = dims.get('time', {}).get('data', [])
@@ -578,13 +582,14 @@ def parse_args():
              'scaling on top of the seasonal threshold (the Pi sleeps more when '
              'restricted sunlight is forecast)')
     parser.add_argument(
-        '--forecast-provider', default='metservice',
+        '--forecast-provider', default='open-meteo',
         choices=sorted(FORECAST_PARSERS) + ['none'],
-        help='solar forecast source (metservice needs --forecast-key)')
+        help='solar forecast source; open-meteo is keyless, metservice is the '
+             'paid NZ MetService API and needs --forecast-key')
     parser.add_argument(
         '--forecast-key', default='',
-        help='API key for the forecast provider (free for metservice from '
-             'console.metoceanapi.com)')
+        help='API key for the forecast provider (required for metservice, a '
+             'paid plan from console.metoceanapi.com)')
     parser.add_argument(
         '--forecast-days', default=3, type=int,
         help='number of forecast days to average available sunlight over')

@@ -42,10 +42,13 @@ day counts as zero (err sleepy).
 
 Providers (`--forecast-provider`):
 
-- `metservice` (default) — the NZ MetService / MetOcean Point Forecast API.
-  Requires a free API key from <https://console.metoceanapi.com/> passed via
-  `--forecast-key`.
-- `open-meteo` — keyless, works out of the box; good for testing.
+- `open-meteo` (default) — keyless and free, works out of the box. Not an
+  NZ-government source, but it serves NZ-region model data.
+- `metservice` — the NZ MetService / MetOcean Point Forecast API. A **paid**
+  plan (from ~US$30/mo, <https://console.metoceanapi.com/>) with the key passed
+  via `--forecast-key`. The response parser is coded against the documented
+  schema but is **unverified against a live response** — confirm it before
+  relying on it.
 - `none` — disable fetching.
 
 Set `--latitude` and `--longitude` for the site. The forecast is fetched at most
@@ -56,14 +59,16 @@ up to `--forecast-max-age-hours` (default 48), after which the bump reverts to
 zero (seasonal-only) — never permanently sleepy, or the node could never wake
 long enough to fetch a fresh forecast.
 
-Example:
+Example (keyless default provider):
 
 ```
 sleepypid.py --winter-fullvoltage 27.0 --fullvoltage 26.0 \
   --latitude -41.1 --longitude 174.8 \
-  --forecast-provider metservice --forecast-key $METSERVICE_KEY \
   --forecast-fullvoltage-span 0.4
 ```
+
+To use the paid MetService source instead, add
+`--forecast-provider metservice --forecast-key $METSERVICE_KEY`.
 
 ## Prometheus metrics
 
