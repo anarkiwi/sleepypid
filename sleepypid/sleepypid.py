@@ -62,6 +62,20 @@ def sleep_duty_seconds(duty_cycle, sleep_interval_mins, max_sleep_mins):
     return i * sleep_interval_mins
 
 
+def soc_sleep_duty(soc, gamma):
+    """Bend the SOC->sleep duty curve so low charge sleeps harder.
+
+    sleep_duty_seconds treats the duty cycle as the SOC directly, which only
+    yields long sleeps once SOC is already deep (E[sleep] = interval*(100-d)/d).
+    Raising the normalised SOC to gamma>1 lowers the duty across the mid-range
+    (e.g. gamma=2 takes 50% SOC down to a 25% duty -> ~3x the sleep) while
+    pinning the 0 and 100 endpoints. gamma=1.0 is the original linear behaviour.
+    """
+    if gamma == 1.0:
+        return soc
+    return (max(0.0, soc) / 100.0) ** gamma * 100.0
+
+
 def send_command(command, args):
     """Send a JSON command to the SleepyPi hat and parse response."""
 
@@ -201,12 +215,16 @@ def daylength_hours(day_of_year, latitude):
 
 
 def seasonal_fullvoltage(args, when=None):
-    """Full-charge voltage scaled by photoperiod.
+    """Full-charge voltage scaled by available solar energy.
 
     With args.winter_fullvoltage set, args.fullvoltage is the lightest-day
     (summer) value and winter_fullvoltage the darkest-day value. The threshold
-    is interpolated by today's daylength between the local solstices: less light
-    -> higher threshold -> the battery reads as less full -> the Pi sleeps more.
+    is interpolated by today's clear-sky solar energy between the yearly
+    extremes: less energy -> higher threshold -> the battery reads as less full
+    -> the Pi sleeps more. Energy (not daylength) is the driver because winter's
+    low sun angle cuts daily charge far more than the shorter day alone implies
+    (at mid-latitudes clear-sky energy bottoms out near 0.27x its summer peak,
+    versus ~0.6x for daylength), so the winter ramp arrives earlier and deeper.
     Returns the static args.fullvoltage when winter_fullvoltage is unset.
     """
     winter = getattr(args, 'winter_fullvoltage', 0)
@@ -214,10 +232,10 @@ def seasonal_fullvoltage(args, when=None):
         return args.fullvoltage
     latitude = getattr(args, 'latitude', 0)
     when = when or datetime.date.today()
-    daylengths = [daylength_hours(d, latitude) for d in range(1, 366)]
-    dmin, dmax = min(daylengths), max(daylengths)
-    today = daylength_hours(when.timetuple().tm_yday, latitude)
-    light = (today - dmin) / (dmax - dmin) if dmax > dmin else 1.0
+    energies = [clearsky_radiation(d, latitude) for d in range(1, 366)]
+    emin, emax = min(energies), max(energies)
+    today = clearsky_radiation(when.timetuple().tm_yday, latitude)
+    light = (today - emin) / (emax - emin) if emax > emin else 1.0
     light = max(0.0, min(1.0, light))
     return winter + light * (args.fullvoltage - winter)
 
@@ -507,9 +525,11 @@ def loop(args):
                 if window_diffs and sample_count >= args.window_samples:
                     fullvoltage = effective_fullvoltage(args, forecast_factor)
                     soc = calc_soc(response[MEAN_V], args, fullvoltage)
+                    duty = soc_sleep_duty(soc, args.soc_sleep_gamma)
                     window_summary = {
                         'window_diffs': window_diffs,
                         'soc': soc,
+                        'duty': duty,
                         'fullvoltage': fullvoltage,
                     }
                     if forecast_enabled(args):
@@ -519,7 +539,7 @@ def loop(args):
                     log_json(args.log, window_summary, args.prometheus)
 
                     if args.sleepscript and (sample_count % args.window_samples == 0):
-                        duration = sleep_duty_seconds(soc, args.minsleepmins, args.maxsleepmins)
+                        duration = sleep_duty_seconds(duty, args.minsleepmins, args.maxsleepmins)
                         if duration:
                             send_command({'command': 'snooze', 'duration': duration}, args)
                             call_script(args.sleepscript)
@@ -610,6 +630,10 @@ def parse_args():
         '--forecast-url', default='',
         help='override the forecast provider base URL (mainly for testing)')
     parser.add_argument(
+        '--soc-sleep-gamma', default=1.0, type=float,
+        help='exponent bending the SOC->sleep curve; >1 sleeps harder at low '
+             'charge (e.g. 2.0 ~triples the sleep at 50%% SOC), 1.0 is linear')
+    parser.add_argument(
         '--minsleepmins', default=MIN_SLEEP_MINS, type=float,
         help='minimum time to sleep')
     parser.add_argument(
@@ -637,6 +661,7 @@ def parse_args():
     main_args = parser.parse_args()
     assert main_args.shutdownvoltage > main_args.deepsleepvoltage
     assert main_args.fullvoltage > main_args.shutdownvoltage
+    assert main_args.soc_sleep_gamma > 0
     if main_args.winter_fullvoltage:
         assert main_args.winter_fullvoltage > main_args.fullvoltage
     if forecast_enabled(main_args) and main_args.forecast_provider == 'metservice':

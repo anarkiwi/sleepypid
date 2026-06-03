@@ -10,8 +10,8 @@ from types import SimpleNamespace
 from prometheus_client import REGISTRY
 import sleepypid
 from sleepypid import (
-    get_uptime, mean_diff, sleep_duty_seconds, calc_soc, flatten_telemetry,
-    log_prometheus, call_script, parse_args, override_args,
+    get_uptime, mean_diff, sleep_duty_seconds, soc_sleep_duty, calc_soc,
+    flatten_telemetry, log_prometheus, call_script, parse_args, override_args,
     daylength_hours, seasonal_fullvoltage,
     extraterrestrial_radiation, clearsky_radiation, forecast_light_factor,
     parse_open_meteo, parse_metservice, effective_fullvoltage, update_forecast)
@@ -78,6 +78,23 @@ class SleepyidTestCase(unittest.TestCase):
         off.winter_fullvoltage = 0.0
         off.latitude = -41.1
         self.assertEqual(25.0, seasonal_fullvoltage(off, datetime.date(2026, 6, 21)))
+
+    def test_seasonal_fullvoltage_energy_ramp(self):
+        # energy-based interpolation runs sleepier (higher threshold) than the
+        # old daylength-linear curve through the dark half of the year, because
+        # winter's low sun angle cuts charge more than the shorter day implies.
+        args = namedtuple('args', ('fullvoltage', 'winter_fullvoltage', 'latitude'))
+        args.fullvoltage = 26.0
+        args.winter_fullvoltage = 27.0
+        args.latitude = -41.102223
+        when = datetime.date(2026, 5, 1)
+        energy = seasonal_fullvoltage(args, when)
+        # the equivalent daylength-linear threshold for the same day
+        daylengths = [daylength_hours(d, args.latitude) for d in range(1, 366)]
+        dmin, dmax = min(daylengths), max(daylengths)
+        light = (daylength_hours(when.timetuple().tm_yday, args.latitude) - dmin) / (dmax - dmin)
+        daylength = args.winter_fullvoltage + light * (args.fullvoltage - args.winter_fullvoltage)
+        self.assertGreater(energy, daylength)
 
     def test_extraterrestrial_radiation(self):
         # FAO-56 Example 8: 3 September (day 246) at 20 S -> Ra ~ 32.2 MJ/m^2
@@ -278,6 +295,24 @@ class SleepyidTestCase(unittest.TestCase):
             pct10_sleep_time += sleep_duty_seconds(10, 15, 1440)
         self.assertGreater(pct10_sleep_time, pct50_sleep_time)
         self.assertGreater(pct50_sleep_time, pct75_sleep_time)
+
+    def test_soc_sleep_duty(self):
+        # gamma 1.0 is the identity (original linear behaviour)
+        self.assertEqual(50, soc_sleep_duty(50, 1.0))
+        # endpoints are pinned regardless of gamma
+        self.assertEqual(0, soc_sleep_duty(0, 2.0))
+        self.assertEqual(100, soc_sleep_duty(100, 2.0))
+        # gamma>1 lowers the mid-range duty -> sleepier for the same SOC
+        self.assertAlmostEqual(25, soc_sleep_duty(50, 2.0), places=5)
+        self.assertLess(soc_sleep_duty(75, 2.0), 75)
+        # a lower duty yields more sleep through sleep_duty_seconds
+        bent = sum(sleep_duty_seconds(soc_sleep_duty(50, 2.0), 15, 1440)
+                   for _ in range(1000))
+        linear = sum(sleep_duty_seconds(50, 15, 1440) for _ in range(1000))
+        self.assertGreater(bent, linear)
+
+    def test_soc_sleep_gamma_arg(self):
+        self.assertEqual(1.0, parse_args().soc_sleep_gamma)
 
     def test_parse_args(self):
         with tempfile.TemporaryDirectory() as test_dir:
