@@ -21,10 +21,22 @@ duty cycling, and logs telemetry.
 For a solar-charged node the battery's "considered full" threshold can be tuned
 to the time of year and site latitude. Set `--winter-fullvoltage` (the darkest-day
 threshold) and `--latitude`; the threshold is then interpolated by today's
-photoperiod between `--winter-fullvoltage` and `--fullvoltage` (the lightest-day
-value). Shorter days raise the threshold, so the battery reads as less full, the
-state-of-charge drops, and the Pi sleeps more. It is off (static `--fullvoltage`)
-unless `--winter-fullvoltage` is set.
+clear-sky solar *energy* between `--winter-fullvoltage` and `--fullvoltage` (the
+lightest-day value). Energy (not just daylength) is the driver because winter's
+low sun angle cuts daily charge more than the shorter day alone implies, so the
+winter ramp arrives earlier and deeper. Less energy raises the threshold, so the
+battery reads as less full, the state-of-charge drops, and the Pi sleeps more. It
+is off (static `--fullvoltage`) unless `--winter-fullvoltage` is set.
+
+## Sleep curve
+
+The Pi's sleep duty cycle is the state-of-charge directly, which only yields long
+sleeps once charge is already deep. `--soc-sleep-gamma` (default `1.0`, linear)
+bends that curve: a value `>1` lowers the duty across the mid-range so the node
+sleeps harder for the same charge (e.g. `2.0` roughly triples the sleep at 50%
+SOC) while still keeping 0% and 100% fixed. This amplifies the seasonal and
+forecast adjustments — and the raw SOC — without distorting the logged SOC. The
+applied duty is exported as `sleepypi_duty`.
 
 ## Solar forecast scaling
 
