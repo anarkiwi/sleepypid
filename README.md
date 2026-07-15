@@ -1,4 +1,4 @@
-# Flashing the firmward onto the SleepyPi
+# Flashing the firmware onto the SleepyPi
 
 1. Install the programming board onto the SleepyPi like pictured [here](https://spellfoundry.com/product/sleepy-pi-external-programming-adapter-console/) (not attached to a Pi though)
 2. Plug in USB-C into the SleepyPi for power
