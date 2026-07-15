@@ -3,6 +3,7 @@
 """SleepyPi hat manager."""
 
 import argparse
+import bisect
 import copy
 import datetime
 import json
@@ -28,6 +29,20 @@ SHUTDOWN_TIMEOUT = 60
 PROMETHEUS_PREFIX = 'sleepypi_'
 prometheus_prefix = PROMETHEUS_PREFIX
 prometheus_gauges = {}
+
+# Published resting open-circuit volts per cell -> SOC%, ascending (see interp_soc).
+OCV_CURVES = {
+    'lifepo4': (
+        (2.500, 0), (3.000, 10), (3.175, 20), (3.200, 30), (3.225, 40),
+        (3.250, 50), (3.275, 60), (3.300, 70), (3.325, 80), (3.350, 90),
+        (3.400, 100),
+    ),
+    'lead-acid': (
+        (1.893, 0), (1.918, 10), (1.943, 20), (1.968, 30), (1.993, 40),
+        (2.017, 50), (2.040, 60), (2.062, 70), (2.083, 80), (2.103, 90),
+        (2.122, 100),
+    ),
+}
 
 
 class SerialException(Exception):
@@ -74,6 +89,65 @@ def soc_sleep_duty(soc, gamma):
     if gamma == 1.0:
         return soc
     return (max(0.0, soc) / 100.0) ** gamma * 100.0
+
+
+def prune_voltage_history(history, now, max_age_seconds):
+    """Drop samples older than max_age_seconds, preserving ascending order."""
+    return [sample for sample in history if now - sample[0] <= max_age_seconds]
+
+
+def voltage_trend(history, min_span_seconds):
+    """Volts/hour from the newest sample at least min_span old, else None.
+
+    Sleep gaps are an asset: hours of baseline lift dV/dt far above the hat's
+    ADC quantisation, which a short in-wake window cannot clear. Both endpoints
+    are sampled awake, so the pack's IR drop is common and cancels.
+    """
+    if len(history) < 2:
+        return None
+    last_ts, last_v = history[-1]
+    baseline = None
+    for sample in history:
+        if last_ts - sample[0] >= min_span_seconds:
+            baseline = sample
+    if baseline is None:
+        return None
+    return (last_v - baseline[1]) * 3600.0 / (last_ts - baseline[0])
+
+
+def charging_state(trend, threshold, previous):
+    """True while the pack is measurably gaining charge.
+
+    Flat is not charging: an idle pack overnight barely moves, so holding a
+    previous 'charging' through the flat would keep the node awake till dawn.
+    The previous state stands only while no trend is measurable at all.
+    """
+    if trend is None:
+        return previous
+    return trend > threshold
+
+
+def charging_duty_scale(args, charging):
+    """Duty scale applied while the pack is not measurably gaining charge.
+
+    Night, or solar failing to carry the load: the node buys the deficit back
+    with sleep now, rather than predicting it.
+    """
+    if charging:
+        return 1.0
+    return max(0.0, min(1.0, getattr(args, 'not_charging_duty_scale', 1.0)))
+
+
+def policy_duty(soc, args, scales):
+    """Duty from measured SOC, reduced by each independent power policy.
+
+    scales multiply because they answer different questions: how dark is the
+    season, how cloudy the forecast, is the pack gaining charge right now.
+    """
+    duty = soc_sleep_duty(soc, args.soc_sleep_gamma)
+    for scale in scales:
+        duty *= scale
+    return duty
 
 
 def send_command(command, args):
@@ -214,42 +288,87 @@ def daylength_hours(day_of_year, latitude):
     return 24.0 - (24.0 / math.pi) * math.acos(arg)
 
 
-def seasonal_fullvoltage(args, when=None):
-    """Full-charge voltage scaled by available solar energy.
+def seasonal_light(args, when=None):
+    """Today's clear-sky solar energy as a fraction of the year's range [0,1].
 
-    With args.winter_fullvoltage set, args.fullvoltage is the lightest-day
-    (summer) value and winter_fullvoltage the darkest-day value. The threshold
-    is interpolated by today's clear-sky solar energy between the yearly
-    extremes: less energy -> higher threshold -> the battery reads as less full
-    -> the Pi sleeps more. Energy (not daylength) is the driver because winter's
-    low sun angle cuts daily charge far more than the shorter day alone implies
-    (at mid-latitudes clear-sky energy bottoms out near 0.27x its summer peak,
-    versus ~0.6x for daylength), so the winter ramp arrives earlier and deeper.
-    Returns the static args.fullvoltage when winter_fullvoltage is unset.
+    Energy, not daylength, drives this: winter's low sun angle cuts daily charge
+    far more than the shorter day implies (clear-sky energy bottoms out near
+    0.27x its summer peak at mid-latitudes, versus ~0.6x for daylength).
     """
-    winter = getattr(args, 'winter_fullvoltage', 0)
-    if not winter:
-        return args.fullvoltage
     latitude = getattr(args, 'latitude', 0)
     when = when or datetime.date.today()
-    energies = [clearsky_radiation(d, latitude) for d in range(1, 366)]
+    energies = [clearsky_radiation(day, latitude) for day in range(1, 366)]
     emin, emax = min(energies), max(energies)
     today = clearsky_radiation(when.timetuple().tm_yday, latitude)
     light = (today - emin) / (emax - emin) if emax > emin else 1.0
-    light = max(0.0, min(1.0, light))
-    return winter + light * (args.fullvoltage - winter)
+    return max(0.0, min(1.0, light))
 
 
-def calc_soc(mean_v, args, fullvoltage=None):
-    """Calculate battery SOC."""
-    # TODO: consider discharge current.
-    if fullvoltage is None:
-        fullvoltage = args.fullvoltage
-    if mean_v >= fullvoltage:
+def ramp_scale(floor, fraction):
+    """Interpolate a duty scale between floor (fraction 0) and 1.0 (fraction 1)."""
+    return floor + max(0.0, min(1.0, fraction)) * (1.0 - floor)
+
+
+def seasonal_duty_scale(args, when=None):
+    """Duty scale that banks energy into the pack as the season darkens.
+
+    Winter offers less energy than the pack can be relied on to replace, so the
+    same SOC must buy a lower duty. This is a policy about reserve, kept
+    separate from SOC, which stays a measurement.
+    """
+    floor = getattr(args, 'winter_duty_scale', 1.0)
+    if floor >= 1.0:
+        return 1.0
+    return ramp_scale(floor, seasonal_light(args, when))
+
+
+def forecast_duty_scale(args, factor):
+    """Duty scale that banks energy ahead of a forecast cloudy spell.
+
+    factor is the expected clear-sky fraction [0,1]; less light -> lower duty,
+    so the node sheds load BEFORE the pack sags rather than after.
+    """
+    floor = getattr(args, 'forecast_duty_scale', 1.0)
+    if floor >= 1.0 or factor is None:
+        return 1.0
+    return ramp_scale(floor, factor)
+
+
+def interp_soc(volts_per_cell, curve):
+    """Interpolate a resting-OCV curve -> SOC%, clamped to the curve's ends.
+
+    Charge is not linear in voltage, so a chemistry curve reads a pack far more
+    faithfully than a ramp between two policy voltages: on LiFePO4's plateau a
+    linear ramp calls a half-empty pack nearly full.
+    """
+    volts = [point[0] for point in curve]
+    socs = [point[1] for point in curve]
+    i = bisect.bisect_left(volts, volts_per_cell)
+    if i == 0:
+        return float(socs[0])
+    if i == len(volts):
+        return float(socs[-1])
+    span = volts[i] - volts[i - 1]
+    frac = (volts_per_cell - volts[i - 1]) / span if span else 0.0
+    return socs[i - 1] + frac * (socs[i] - socs[i - 1])
+
+
+def calc_soc(mean_v, args):
+    """Measure battery SOC, by OCV curve when a chemistry is configured.
+
+    Falls back to the legacy linear ramp between --shutdownvoltage and
+    --fullvoltage when --battery-chemistry is 'linear'. SOC is a measurement:
+    policy belongs in the duty scales, not in a moved goalpost here.
+    """
+    # TODO: IR-compensate with MEAN_C; a loaded reading sits below true OCV.
+    curve = OCV_CURVES.get(getattr(args, 'battery_chemistry', 'linear'))
+    if curve:
+        return interp_soc(mean_v / args.battery_cells, curve)
+    if mean_v >= args.fullvoltage:
         return 100
     if mean_v <= args.shutdownvoltage:
         return 0
-    return (mean_v - args.shutdownvoltage) / (fullvoltage - args.shutdownvoltage) * 100
+    return (mean_v - args.shutdownvoltage) / (args.fullvoltage - args.shutdownvoltage) * 100
 
 
 def extraterrestrial_radiation(day_of_year, latitude):
@@ -373,8 +492,8 @@ def fetch_forecast(args):
         return json.loads(resp.read().decode())
 
 
-def load_forecast_cache(path):
-    """Return the cached forecast dict, or None if absent/unreadable."""
+def load_json_cache(path):
+    """Return the cached JSON object, or None if absent/unreadable."""
     try:
         with open(path, encoding='utf-8') as cache:
             return json.loads(cache.read())
@@ -382,8 +501,8 @@ def load_forecast_cache(path):
         return None
 
 
-def save_forecast_cache(path, obj):
-    """Persist the forecast dict so the factor survives sleep cycles."""
+def save_json_cache(path, obj):
+    """Persist a JSON object so it survives sleep cycles."""
     parent = os.path.dirname(path)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
@@ -421,7 +540,7 @@ def record_forecast_error(args, cache):
     errors = cache.setdefault('errors', {})
     errors[args.forecast_provider] = errors.get(args.forecast_provider, 0) + 1
     try:
-        save_forecast_cache(args.forecast_cache, cache)
+        save_json_cache(args.forecast_cache, cache)
     except OSError:
         pass
     return cache
@@ -439,7 +558,7 @@ def update_forecast(args, now=None, fetcher=fetch_forecast):
     """
     if now is None:
         now = time.time()
-    cache = load_forecast_cache(args.forecast_cache)
+    cache = load_json_cache(args.forecast_cache)
     if cache and 'factor' in cache:
         age = now - cache.get('ts', 0)
         if age < args.forecast_refresh_hours * 3600:
@@ -454,7 +573,7 @@ def update_forecast(args, now=None, fetcher=fetch_forecast):
             'factor': factor, 'daily_ghi': daily,
             'errors': (cache or {}).get('errors', {}),
         }
-        save_forecast_cache(args.forecast_cache, new_cache)
+        save_json_cache(args.forecast_cache, new_cache)
         return factor, forecast_status(args, factor, 0.0, new_cache, 'live')
     except (OSError, ValueError, KeyError):
         cache = record_forecast_error(args, cache)
@@ -466,22 +585,9 @@ def update_forecast(args, now=None, fetcher=fetch_forecast):
 
 
 def forecast_enabled(args):
-    """True when forecast scaling is opted in (a span and a real provider)."""
-    return (getattr(args, 'forecast_fullvoltage_span', 0.0) > 0 and
+    """True when forecast scaling is opted in (a scale and a real provider)."""
+    return (getattr(args, 'forecast_duty_scale', 1.0) < 1.0 and
             getattr(args, 'forecast_provider', 'none') != 'none')
-
-
-def effective_fullvoltage(args, factor, when=None):
-    """Seasonal full voltage plus a forecast bump when sunlight is restricted.
-
-    factor is the expected clear-sky fraction [0,1]; less light -> larger bump
-    -> battery reads less full -> the Pi sleeps more.
-    """
-    full = seasonal_fullvoltage(args, when)
-    span = getattr(args, 'forecast_fullvoltage_span', 0.0)
-    if not span or factor is None:
-        return full
-    return full + (1.0 - max(0.0, min(1.0, factor))) * span
 
 
 def call_script(script, timeout=SHUTDOWN_TIMEOUT):
@@ -499,6 +605,11 @@ def loop(args):
     forecast_factor = 1.0
     forecast_telemetry = {}
     next_forecast = 0
+    history_max_age = args.voltage_history_max_age_hours * 3600
+    voltage_history = prune_voltage_history(
+        load_json_cache(args.voltage_history) or [], time.time(), history_max_age)
+    # fail awake: an unknown charge state must never strand the node asleep.
+    charging = True
 
     # TODO: sync sleepypi rtc with settime/hwclock -w if out of sync
     while True:
@@ -522,21 +633,39 @@ def loop(args):
                     window_stats[stat] = window_stats[stat][-(args.window_samples):]
                     if len(window_stats[stat]) > 1:
                         window_diffs[stat] = mean_diff(window_stats[stat])
+                now = time.time()
+                voltage_history = prune_voltage_history(
+                    voltage_history + [[now, response[MEAN_V]]], now, history_max_age)
+                trend = voltage_trend(voltage_history, args.charge_min_span_mins * 60)
+                charging = charging_state(
+                    trend, args.charge_trend_threshold, charging)
                 if window_diffs and sample_count >= args.window_samples:
-                    fullvoltage = effective_fullvoltage(args, forecast_factor)
-                    soc = calc_soc(response[MEAN_V], args, fullvoltage)
-                    duty = soc_sleep_duty(soc, args.soc_sleep_gamma)
+                    soc = calc_soc(response[MEAN_V], args)
+                    seasonal_scale = seasonal_duty_scale(args)
+                    cloud_scale = forecast_duty_scale(args, forecast_factor)
+                    charge_scale = charging_duty_scale(args, charging)
+                    duty = policy_duty(
+                        soc, args, (seasonal_scale, cloud_scale, charge_scale))
                     window_summary = {
                         'window_diffs': window_diffs,
                         'soc': soc,
                         'duty': duty,
-                        'fullvoltage': fullvoltage,
+                        'charging': charging,
+                        'seasonal_duty_scale': seasonal_scale,
+                        'forecast_duty_scale': cloud_scale,
+                        'charging_duty_scale': charge_scale,
                     }
+                    if trend is not None:
+                        window_summary['voltage_trend'] = trend
                     if forecast_enabled(args):
                         window_summary.update(forecast_telemetry)
-                        window_summary['forecast_bump'] = (
-                            fullvoltage - seasonal_fullvoltage(args))
                     log_json(args.log, window_summary, args.prometheus)
+
+                    # persisted here so the pre-sleep sample survives the poweroff
+                    try:
+                        save_json_cache(args.voltage_history, voltage_history)
+                    except OSError:
+                        pass
 
                     if args.sleepscript and (sample_count % args.window_samples == 0):
                         duration = sleep_duty_seconds(duty, args.minsleepmins, args.maxsleepmins)
@@ -572,6 +701,36 @@ def parse_args():
         '--window_samples', default=DEFAULT_WINDOW_SAMPLES, type=int,
         help='window size for sample results')
     parser.add_argument(
+        '--battery-chemistry', default='linear', choices=['linear'] + sorted(OCV_CURVES),
+        help='battery chemistry; a chemistry interpolates its resting OCV curve '
+             'for SOC and ignores --fullvoltage (and so the seasonal/forecast '
+             'scaling of it). "linear" keeps the legacy ramp between '
+             '--shutdownvoltage and --fullvoltage')
+    parser.add_argument(
+        '--battery-cells', default=0, type=int,
+        help='cells in series; required with --battery-chemistry (e.g. 8 for a '
+             '24V LiFePO4 pack), as OCV curves are per cell')
+    parser.add_argument(
+        '--not-charging-duty-scale', default=1.0, type=float,
+        help='scale the duty cycle by this while the pack is not charging, so '
+             'the node sleeps harder overnight (1.0 disables)')
+    parser.add_argument(
+        '--charge-trend-threshold', default=0.01, type=float,
+        help='volts/hour above which the pack counts as charging; at or below '
+             'it (including flat) it does not')
+    parser.add_argument(
+        '--charge-min-span-mins', default=180, type=int,
+        help='minimum baseline for a charge trend. A solar pack drifts slowly, '
+             'so short spans are mostly sensor noise: on a 24V LiFePO4 pack a '
+             '30m span misread ~45%% of the night as charging, 3h under 5%%')
+    parser.add_argument(
+        '--voltage-history', default='/var/lib/sleepypid/voltage.json',
+        help='where supply voltage samples persist, so a trend can be measured '
+             'across a sleep')
+    parser.add_argument(
+        '--voltage-history-max-age-hours', default=24.0, type=float,
+        help='discard persisted voltage samples older than this')
+    parser.add_argument(
         '--deepsleepvoltage', default=12.8, type=float,
         help='voltage at which sleepypi will disable power itself')
     parser.add_argument(
@@ -585,22 +744,22 @@ def parse_args():
         help='voltage at which the battery is considered full (the '
              'lightest-day value when --winter-fullvoltage is set)')
     parser.add_argument(
-        '--winter-fullvoltage', default=0.0, type=float,
-        help='full voltage at the darkest day of the year; if set (>0), the '
-             'considered-full threshold is scaled by photoperiod between this '
-             'and --fullvoltage so the Pi sleeps more in the dark season')
+        '--winter-duty-scale', default=1.0, type=float,
+        help='duty scale at the darkest day of the year, ramping to 1.0 at the '
+             'lightest by clear-sky solar energy. Winter offers less energy '
+             'than the pack can be relied on to replace, so the same SOC buys '
+             'a lower duty and banks the difference (1.0 disables)')
     parser.add_argument(
         '--latitude', default=0.0, type=float,
-        help='site latitude in degrees (negative south) for --winter-fullvoltage')
+        help='site latitude in degrees (negative south) for --winter-duty-scale')
     parser.add_argument(
         '--longitude', default=0.0, type=float,
         help='site longitude in degrees (negative west) for the solar forecast')
     parser.add_argument(
-        '--forecast-fullvoltage-span', default=0.0, type=float,
-        help='max extra volts added to the considered-full threshold when the '
-             'solar forecast shows no sunlight; if set (>0), enables forecast '
-             'scaling on top of the seasonal threshold (the Pi sleeps more when '
-             'restricted sunlight is forecast)')
+        '--forecast-duty-scale', default=1.0, type=float,
+        help='duty scale when the solar forecast shows no sunlight, ramping to '
+             '1.0 at a clear forecast, so the node banks energy BEFORE a cloudy '
+             'spell rather than after it (1.0 disables)')
     parser.add_argument(
         '--forecast-provider', default='open-meteo',
         choices=sorted(FORECAST_PARSERS) + ['none'],
@@ -662,8 +821,15 @@ def parse_args():
     assert main_args.shutdownvoltage > main_args.deepsleepvoltage
     assert main_args.fullvoltage > main_args.shutdownvoltage
     assert main_args.soc_sleep_gamma > 0
-    if main_args.winter_fullvoltage:
-        assert main_args.winter_fullvoltage > main_args.fullvoltage
+    assert main_args.charge_trend_threshold >= 0
+    for scale in ('not_charging_duty_scale', 'winter_duty_scale',
+                  'forecast_duty_scale'):
+        assert 0.0 <= getattr(main_args, scale) <= 1.0, '%s must be 0..1' % scale
+    if main_args.battery_chemistry != 'linear':
+        assert main_args.battery_cells > 0, \
+            '--battery-chemistry requires --battery-cells'
+    if main_args.winter_duty_scale < 1.0:
+        assert main_args.latitude, '--winter-duty-scale requires --latitude'
     if forecast_enabled(main_args) and main_args.forecast_provider == 'metservice':
         assert main_args.forecast_key, '--forecast-provider metservice requires --forecast-key'
     return main_args
