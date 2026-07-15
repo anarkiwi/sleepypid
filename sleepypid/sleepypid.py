@@ -3,6 +3,7 @@
 """SleepyPi hat manager."""
 
 import argparse
+import bisect
 import copy
 import datetime
 import json
@@ -28,6 +29,20 @@ SHUTDOWN_TIMEOUT = 60
 PROMETHEUS_PREFIX = 'sleepypi_'
 prometheus_prefix = PROMETHEUS_PREFIX
 prometheus_gauges = {}
+
+# Published resting open-circuit volts per cell -> SOC%, ascending (see interp_soc).
+OCV_CURVES = {
+    'lifepo4': (
+        (2.500, 0), (3.000, 10), (3.175, 20), (3.200, 30), (3.225, 40),
+        (3.250, 50), (3.275, 60), (3.300, 70), (3.325, 80), (3.350, 90),
+        (3.400, 100),
+    ),
+    'lead-acid': (
+        (1.893, 0), (1.918, 10), (1.943, 20), (1.968, 30), (1.993, 40),
+        (2.017, 50), (2.040, 60), (2.062, 70), (2.083, 80), (2.103, 90),
+        (2.122, 100),
+    ),
+}
 
 
 class SerialException(Exception):
@@ -74,6 +89,55 @@ def soc_sleep_duty(soc, gamma):
     if gamma == 1.0:
         return soc
     return (max(0.0, soc) / 100.0) ** gamma * 100.0
+
+
+def prune_voltage_history(history, now, max_age_seconds):
+    """Drop samples older than max_age_seconds, preserving ascending order."""
+    return [sample for sample in history if now - sample[0] <= max_age_seconds]
+
+
+def voltage_trend(history, min_span_seconds):
+    """Volts/hour from the newest sample at least min_span old, else None.
+
+    Sleep gaps are an asset: hours of baseline lift dV/dt far above the hat's
+    ADC quantisation, which a short in-wake window cannot clear. Both endpoints
+    are sampled awake, so the pack's IR drop is common and cancels.
+    """
+    if len(history) < 2:
+        return None
+    last_ts, last_v = history[-1]
+    baseline = None
+    for sample in history:
+        if last_ts - sample[0] >= min_span_seconds:
+            baseline = sample
+    if baseline is None:
+        return None
+    return (last_v - baseline[1]) * 3600.0 / (last_ts - baseline[0])
+
+
+def charging_state(trend, threshold, previous):
+    """True while the pack is measurably gaining charge.
+
+    Flat is not charging: an idle pack overnight barely moves, so holding a
+    previous 'charging' through the flat would keep the node awake till dawn.
+    The previous state stands only while no trend is measurable at all.
+    """
+    if trend is None:
+        return previous
+    return trend > threshold
+
+
+def charge_aware_duty(soc, args, charging):
+    """Scale the SOC duty down whenever the pack is not charging.
+
+    Not charging is night, or solar failing to carry the load; either way the
+    node buys the deficit back with sleep instead of predicting it.
+    """
+    duty = soc_sleep_duty(soc, args.soc_sleep_gamma)
+    if charging:
+        return duty
+    scale = getattr(args, 'not_charging_duty_scale', 1.0)
+    return duty * max(0.0, min(1.0, scale))
 
 
 def send_command(command, args):
@@ -240,9 +304,35 @@ def seasonal_fullvoltage(args, when=None):
     return winter + light * (args.fullvoltage - winter)
 
 
+def interp_soc(volts_per_cell, curve):
+    """Interpolate a resting-OCV curve -> SOC%, clamped to the curve's ends.
+
+    Charge is not linear in voltage, so a chemistry curve reads a pack far more
+    faithfully than a ramp between two policy voltages: on LiFePO4's plateau a
+    linear ramp calls a half-empty pack nearly full.
+    """
+    volts = [point[0] for point in curve]
+    socs = [point[1] for point in curve]
+    i = bisect.bisect_left(volts, volts_per_cell)
+    if i == 0:
+        return float(socs[0])
+    if i == len(volts):
+        return float(socs[-1])
+    span = volts[i] - volts[i - 1]
+    frac = (volts_per_cell - volts[i - 1]) / span if span else 0.0
+    return socs[i - 1] + frac * (socs[i] - socs[i - 1])
+
+
 def calc_soc(mean_v, args, fullvoltage=None):
-    """Calculate battery SOC."""
-    # TODO: consider discharge current.
+    """Calculate battery SOC, by OCV curve when a chemistry is configured.
+
+    Falls back to the legacy linear ramp between --shutdownvoltage and
+    fullvoltage when --battery-chemistry is 'linear'.
+    """
+    # TODO: IR-compensate with MEAN_C; a loaded reading sits below true OCV.
+    curve = OCV_CURVES.get(getattr(args, 'battery_chemistry', 'linear'))
+    if curve:
+        return interp_soc(mean_v / args.battery_cells, curve)
     if fullvoltage is None:
         fullvoltage = args.fullvoltage
     if mean_v >= fullvoltage:
@@ -373,8 +463,8 @@ def fetch_forecast(args):
         return json.loads(resp.read().decode())
 
 
-def load_forecast_cache(path):
-    """Return the cached forecast dict, or None if absent/unreadable."""
+def load_json_cache(path):
+    """Return the cached JSON object, or None if absent/unreadable."""
     try:
         with open(path, encoding='utf-8') as cache:
             return json.loads(cache.read())
@@ -382,8 +472,8 @@ def load_forecast_cache(path):
         return None
 
 
-def save_forecast_cache(path, obj):
-    """Persist the forecast dict so the factor survives sleep cycles."""
+def save_json_cache(path, obj):
+    """Persist a JSON object so it survives sleep cycles."""
     parent = os.path.dirname(path)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
@@ -421,7 +511,7 @@ def record_forecast_error(args, cache):
     errors = cache.setdefault('errors', {})
     errors[args.forecast_provider] = errors.get(args.forecast_provider, 0) + 1
     try:
-        save_forecast_cache(args.forecast_cache, cache)
+        save_json_cache(args.forecast_cache, cache)
     except OSError:
         pass
     return cache
@@ -439,7 +529,7 @@ def update_forecast(args, now=None, fetcher=fetch_forecast):
     """
     if now is None:
         now = time.time()
-    cache = load_forecast_cache(args.forecast_cache)
+    cache = load_json_cache(args.forecast_cache)
     if cache and 'factor' in cache:
         age = now - cache.get('ts', 0)
         if age < args.forecast_refresh_hours * 3600:
@@ -454,7 +544,7 @@ def update_forecast(args, now=None, fetcher=fetch_forecast):
             'factor': factor, 'daily_ghi': daily,
             'errors': (cache or {}).get('errors', {}),
         }
-        save_forecast_cache(args.forecast_cache, new_cache)
+        save_json_cache(args.forecast_cache, new_cache)
         return factor, forecast_status(args, factor, 0.0, new_cache, 'live')
     except (OSError, ValueError, KeyError):
         cache = record_forecast_error(args, cache)
@@ -499,6 +589,11 @@ def loop(args):
     forecast_factor = 1.0
     forecast_telemetry = {}
     next_forecast = 0
+    history_max_age = args.voltage_history_max_age_hours * 3600
+    voltage_history = prune_voltage_history(
+        load_json_cache(args.voltage_history) or [], time.time(), history_max_age)
+    # fail awake: an unknown charge state must never strand the node asleep.
+    charging = True
 
     # TODO: sync sleepypi rtc with settime/hwclock -w if out of sync
     while True:
@@ -522,21 +617,36 @@ def loop(args):
                     window_stats[stat] = window_stats[stat][-(args.window_samples):]
                     if len(window_stats[stat]) > 1:
                         window_diffs[stat] = mean_diff(window_stats[stat])
+                now = time.time()
+                voltage_history = prune_voltage_history(
+                    voltage_history + [[now, response[MEAN_V]]], now, history_max_age)
+                trend = voltage_trend(voltage_history, args.charge_min_span_mins * 60)
+                charging = charging_state(
+                    trend, args.charge_trend_threshold, charging)
                 if window_diffs and sample_count >= args.window_samples:
                     fullvoltage = effective_fullvoltage(args, forecast_factor)
                     soc = calc_soc(response[MEAN_V], args, fullvoltage)
-                    duty = soc_sleep_duty(soc, args.soc_sleep_gamma)
+                    duty = charge_aware_duty(soc, args, charging)
                     window_summary = {
                         'window_diffs': window_diffs,
                         'soc': soc,
                         'duty': duty,
                         'fullvoltage': fullvoltage,
+                        'charging': charging,
                     }
+                    if trend is not None:
+                        window_summary['voltage_trend'] = trend
                     if forecast_enabled(args):
                         window_summary.update(forecast_telemetry)
                         window_summary['forecast_bump'] = (
                             fullvoltage - seasonal_fullvoltage(args))
                     log_json(args.log, window_summary, args.prometheus)
+
+                    # persisted here so the pre-sleep sample survives the poweroff
+                    try:
+                        save_json_cache(args.voltage_history, voltage_history)
+                    except OSError:
+                        pass
 
                     if args.sleepscript and (sample_count % args.window_samples == 0):
                         duration = sleep_duty_seconds(duty, args.minsleepmins, args.maxsleepmins)
@@ -571,6 +681,36 @@ def parse_args():
     parser.add_argument(
         '--window_samples', default=DEFAULT_WINDOW_SAMPLES, type=int,
         help='window size for sample results')
+    parser.add_argument(
+        '--battery-chemistry', default='linear', choices=['linear'] + sorted(OCV_CURVES),
+        help='battery chemistry; a chemistry interpolates its resting OCV curve '
+             'for SOC and ignores --fullvoltage (and so the seasonal/forecast '
+             'scaling of it). "linear" keeps the legacy ramp between '
+             '--shutdownvoltage and --fullvoltage')
+    parser.add_argument(
+        '--battery-cells', default=0, type=int,
+        help='cells in series; required with --battery-chemistry (e.g. 8 for a '
+             '24V LiFePO4 pack), as OCV curves are per cell')
+    parser.add_argument(
+        '--not-charging-duty-scale', default=1.0, type=float,
+        help='scale the duty cycle by this while the pack is not charging, so '
+             'the node sleeps harder overnight (1.0 disables)')
+    parser.add_argument(
+        '--charge-trend-threshold', default=0.01, type=float,
+        help='volts/hour above which the pack counts as charging; at or below '
+             'it (including flat) it does not')
+    parser.add_argument(
+        '--charge-min-span-mins', default=180, type=int,
+        help='minimum baseline for a charge trend. A solar pack drifts slowly, '
+             'so short spans are mostly sensor noise: on a 24V LiFePO4 pack a '
+             '30m span misread ~45%% of the night as charging, 3h under 5%%')
+    parser.add_argument(
+        '--voltage-history', default='/var/lib/sleepypid/voltage.json',
+        help='where supply voltage samples persist, so a trend can be measured '
+             'across a sleep')
+    parser.add_argument(
+        '--voltage-history-max-age-hours', default=24.0, type=float,
+        help='discard persisted voltage samples older than this')
     parser.add_argument(
         '--deepsleepvoltage', default=12.8, type=float,
         help='voltage at which sleepypi will disable power itself')
@@ -662,6 +802,15 @@ def parse_args():
     assert main_args.shutdownvoltage > main_args.deepsleepvoltage
     assert main_args.fullvoltage > main_args.shutdownvoltage
     assert main_args.soc_sleep_gamma > 0
+    assert 0.0 <= main_args.not_charging_duty_scale <= 1.0
+    assert main_args.charge_trend_threshold >= 0
+    if main_args.battery_chemistry != 'linear':
+        assert main_args.battery_cells > 0, \
+            '--battery-chemistry requires --battery-cells'
+        assert not main_args.winter_fullvoltage, \
+            '--winter-fullvoltage scales --fullvoltage, which an OCV curve ignores'
+        assert not forecast_enabled(main_args), \
+            '--forecast-fullvoltage-span scales --fullvoltage, which an OCV curve ignores'
     if main_args.winter_fullvoltage:
         assert main_args.winter_fullvoltage > main_args.fullvoltage
     if forecast_enabled(main_args) and main_args.forecast_provider == 'metservice':
