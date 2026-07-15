@@ -12,11 +12,11 @@ import sleepypid
 from sleepypid import (
     get_uptime, mean_diff, sleep_duty_seconds, soc_sleep_duty, calc_soc,
     flatten_telemetry, log_prometheus, call_script, parse_args, override_args,
-    daylength_hours, seasonal_fullvoltage,
+    daylength_hours, seasonal_light, seasonal_duty_scale, forecast_duty_scale,
     extraterrestrial_radiation, clearsky_radiation, forecast_light_factor,
-    parse_open_meteo, parse_metservice, effective_fullvoltage, update_forecast,
+    parse_open_meteo, parse_metservice, update_forecast,
     OCV_CURVES, interp_soc, prune_voltage_history, voltage_trend,
-    charging_state, charge_aware_duty)
+    charging_state, charging_duty_scale, policy_duty)
 
 
 class SleepyidTestCase(unittest.TestCase):
@@ -40,18 +40,11 @@ class SleepyidTestCase(unittest.TestCase):
         self.assertEqual(0, calc_soc(12.8, args))
         self.assertAlmostEqual(50, calc_soc(13.1, args), places=2)
 
-    def test_calc_soc_dynamic_fullvoltage(self):
+    def test_calc_soc_linear_static_fullvoltage(self):
         args = namedtuple('args', ('fullvoltage', 'shutdownvoltage'))
         args.fullvoltage = 26.0
         args.shutdownvoltage = 24.3
-        # default uses args.fullvoltage
         self.assertAlmostEqual(41.18, calc_soc(25.0, args), places=1)
-        # an explicit (e.g. winter) higher full -> lower SOC for the same
-        # voltage -> the Pi is more likely to sleep
-        soc_summer = calc_soc(25.0, args, 26.0)
-        soc_winter = calc_soc(25.0, args, 27.0)
-        self.assertGreater(soc_summer, soc_winter)
-        self.assertAlmostEqual(25.93, soc_winter, places=1)
 
     def test_daylength_hours(self):
         # southern hemisphere: winter solstice (Jun) shorter than summer (Dec)
@@ -63,40 +56,35 @@ class SleepyidTestCase(unittest.TestCase):
         # equator is ~12h year round
         self.assertAlmostEqual(daylength_hours(172, 0.0), 12.0, delta=0.2)
 
-    def test_seasonal_fullvoltage(self):
-        args = namedtuple('args', ('fullvoltage', 'winter_fullvoltage', 'latitude'))
-        args.fullvoltage = 26.0
-        args.winter_fullvoltage = 27.0
-        args.latitude = -41.102223
-        winter = seasonal_fullvoltage(args, datetime.date(2026, 6, 21))
-        summer = seasonal_fullvoltage(args, datetime.date(2026, 12, 21))
-        # darkest day -> near the winter bar, lightest day -> near summer
-        self.assertAlmostEqual(winter, 27.0, delta=0.05)
-        self.assertAlmostEqual(summer, 26.0, delta=0.05)
-        self.assertGreater(winter, summer)
-        # disabled (winter_fullvoltage falsy) -> static fullvoltage
-        off = namedtuple('args', ('fullvoltage', 'winter_fullvoltage', 'latitude'))
-        off.fullvoltage = 25.0
-        off.winter_fullvoltage = 0.0
-        off.latitude = -41.1
-        self.assertEqual(25.0, seasonal_fullvoltage(off, datetime.date(2026, 6, 21)))
+    def test_seasonal_duty_scale(self):
+        args = SimpleNamespace(winter_duty_scale=0.5, latitude=-41.102223)
+        winter = seasonal_duty_scale(args, datetime.date(2026, 6, 21))
+        summer = seasonal_duty_scale(args, datetime.date(2026, 12, 21))
+        # southern hemisphere: darkest June -> banks hardest, lightest Dec -> free
+        self.assertAlmostEqual(0.5, winter, places=2)
+        self.assertAlmostEqual(1.0, summer, places=2)
+        self.assertLess(winter, summer)
 
-    def test_seasonal_fullvoltage_energy_ramp(self):
-        # energy-based interpolation runs sleepier (higher threshold) than the
-        # old daylength-linear curve through the dark half of the year, because
-        # winter's low sun angle cuts charge more than the shorter day implies.
-        args = namedtuple('args', ('fullvoltage', 'winter_fullvoltage', 'latitude'))
-        args.fullvoltage = 26.0
-        args.winter_fullvoltage = 27.0
-        args.latitude = -41.102223
+    def test_seasonal_duty_scale_disabled(self):
+        off = SimpleNamespace(winter_duty_scale=1.0, latitude=-41.102223)
+        self.assertEqual(1.0, seasonal_duty_scale(off, datetime.date(2026, 6, 21)))
+
+    def test_seasonal_duty_scale_energy_ramp(self):
+        # energy-based interpolation banks harder than a daylength-linear ramp
+        # through the dark half: winter's low sun angle cuts charge more than
+        # the shorter day implies.
+        args = SimpleNamespace(winter_duty_scale=0.5, latitude=-41.102223)
         when = datetime.date(2026, 5, 1)
-        energy = seasonal_fullvoltage(args, when)
-        # the equivalent daylength-linear threshold for the same day
+        energy = seasonal_duty_scale(args, when)
         daylengths = [daylength_hours(d, args.latitude) for d in range(1, 366)]
         dmin, dmax = min(daylengths), max(daylengths)
         light = (daylength_hours(when.timetuple().tm_yday, args.latitude) - dmin) / (dmax - dmin)
-        daylength = args.winter_fullvoltage + light * (args.fullvoltage - args.winter_fullvoltage)
-        self.assertGreater(energy, daylength)
+        self.assertLess(energy, 0.5 + light * 0.5)
+
+    def test_seasonal_light_bounds(self):
+        args = SimpleNamespace(latitude=-41.102223)
+        self.assertAlmostEqual(0.0, seasonal_light(args, datetime.date(2026, 6, 21)), places=2)
+        self.assertAlmostEqual(1.0, seasonal_light(args, datetime.date(2026, 12, 21)), places=2)
 
     def test_extraterrestrial_radiation(self):
         # FAO-56 Example 8: 3 September (day 246) at 20 S -> Ra ~ 32.2 MJ/m^2
@@ -120,19 +108,18 @@ class SleepyidTestCase(unittest.TestCase):
             0.5, forecast_light_factor([None, clearsky], when, lat), delta=0.05)
         self.assertEqual(1.0, forecast_light_factor([], when, lat))
 
-    def test_effective_fullvoltage(self):
-        args = SimpleNamespace(
-            fullvoltage=26.0, winter_fullvoltage=0.0, latitude=-41.1,
-            forecast_fullvoltage_span=0.5)
-        when = datetime.date(2026, 6, 21)
-        # factor 1.0 (clear) -> seasonal value unchanged
-        self.assertAlmostEqual(26.0, effective_fullvoltage(args, 1.0, when), places=5)
-        # factor 0.0 (dark) -> seasonal + full span -> sleepier
-        self.assertAlmostEqual(26.5, effective_fullvoltage(args, 0.0, when), places=5)
-        self.assertAlmostEqual(26.25, effective_fullvoltage(args, 0.5, when), places=5)
-        # span 0 disables the forecast bump entirely
-        args.forecast_fullvoltage_span = 0.0
-        self.assertAlmostEqual(26.0, effective_fullvoltage(args, 0.0, when), places=5)
+    def test_forecast_duty_scale(self):
+        args = SimpleNamespace(forecast_duty_scale=0.5)
+        # clear forecast -> no banking; overcast -> full banking
+        self.assertAlmostEqual(1.0, forecast_duty_scale(args, 1.0), places=5)
+        self.assertAlmostEqual(0.5, forecast_duty_scale(args, 0.0), places=5)
+        self.assertAlmostEqual(0.75, forecast_duty_scale(args, 0.5), places=5)
+
+    def test_forecast_duty_scale_disabled(self):
+        args = SimpleNamespace(forecast_duty_scale=1.0)
+        self.assertEqual(1.0, forecast_duty_scale(args, 0.0))
+        args.forecast_duty_scale = 0.5
+        self.assertEqual(1.0, forecast_duty_scale(args, None))
 
     def test_parse_open_meteo(self):
         payload = {"daily": {"time": ["2026-06-02", "2026-06-03", "2026-06-04"],
@@ -356,7 +343,10 @@ class SleepyidTestCase(unittest.TestCase):
         args = SimpleNamespace(battery_chemistry='lifepo4', battery_cells=8,
                                fullvoltage=26.0, shutdownvoltage=24.3)
         # an OCV curve is a property of the pack, not of a policy voltage
-        self.assertEqual(calc_soc(26.4, args), calc_soc(26.4, args, 99.0))
+        before = calc_soc(26.4, args)
+        args.fullvoltage = 99.0
+        self.assertEqual(before, calc_soc(26.4, args))
+        self.assertAlmostEqual(70.0, before, places=1)
 
     def test_prune_voltage_history(self):
         history = [[100, 26.0], [200, 26.1], [300, 26.2]]
@@ -397,21 +387,29 @@ class SleepyidTestCase(unittest.TestCase):
         self.assertTrue(charging_state(None, 0.01, True))
         self.assertFalse(charging_state(None, 0.01, False))
 
-    def test_charge_aware_duty(self):
-        args = SimpleNamespace(soc_sleep_gamma=2.0, not_charging_duty_scale=0.25)
-        charging = charge_aware_duty(64.5, args, True)
-        idle = charge_aware_duty(64.5, args, False)
-        self.assertAlmostEqual(41.6, charging, places=1)
-        self.assertAlmostEqual(charging * 0.25, idle, places=5)
-        # scale 1.0 is the neutral default -> charge state stops mattering
-        neutral = SimpleNamespace(soc_sleep_gamma=2.0, not_charging_duty_scale=1.0)
-        self.assertEqual(charge_aware_duty(64.5, neutral, True),
-                         charge_aware_duty(64.5, neutral, False))
+    def test_charging_duty_scale(self):
+        args = SimpleNamespace(not_charging_duty_scale=0.25)
+        self.assertEqual(1.0, charging_duty_scale(args, True))
+        self.assertEqual(0.25, charging_duty_scale(args, False))
+        neutral = SimpleNamespace(not_charging_duty_scale=1.0)
+        self.assertEqual(1.0, charging_duty_scale(neutral, False))
+
+    def test_policy_duty_composes_scales(self):
+        args = SimpleNamespace(soc_sleep_gamma=2.0)
+        base = policy_duty(64.5, args, ())
+        self.assertAlmostEqual(41.6, base, places=1)
+        # independent policies multiply: dark season AND not charging
+        self.assertAlmostEqual(base * 0.5 * 0.25,
+                               policy_duty(64.5, args, (0.5, 0.25)), places=5)
+        # neutral scales leave the SOC duty alone
+        self.assertAlmostEqual(base, policy_duty(64.5, args, (1.0, 1.0)), places=5)
 
     def test_charge_args_default_neutral(self):
         args = parse_args()
         self.assertEqual('linear', args.battery_chemistry)
         self.assertEqual(1.0, args.not_charging_duty_scale)
+        self.assertEqual(1.0, args.winter_duty_scale)
+        self.assertEqual(1.0, args.forecast_duty_scale)
 
     def test_parse_args(self):
         with tempfile.TemporaryDirectory() as test_dir:

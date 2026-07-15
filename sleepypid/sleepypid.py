@@ -127,17 +127,27 @@ def charging_state(trend, threshold, previous):
     return trend > threshold
 
 
-def charge_aware_duty(soc, args, charging):
-    """Scale the SOC duty down whenever the pack is not charging.
+def charging_duty_scale(args, charging):
+    """Duty scale applied while the pack is not measurably gaining charge.
 
-    Not charging is night, or solar failing to carry the load; either way the
-    node buys the deficit back with sleep instead of predicting it.
+    Night, or solar failing to carry the load: the node buys the deficit back
+    with sleep now, rather than predicting it.
+    """
+    if charging:
+        return 1.0
+    return max(0.0, min(1.0, getattr(args, 'not_charging_duty_scale', 1.0)))
+
+
+def policy_duty(soc, args, scales):
+    """Duty from measured SOC, reduced by each independent power policy.
+
+    scales multiply because they answer different questions: how dark is the
+    season, how cloudy the forecast, is the pack gaining charge right now.
     """
     duty = soc_sleep_duty(soc, args.soc_sleep_gamma)
-    if charging:
-        return duty
-    scale = getattr(args, 'not_charging_duty_scale', 1.0)
-    return duty * max(0.0, min(1.0, scale))
+    for scale in scales:
+        duty *= scale
+    return duty
 
 
 def send_command(command, args):
@@ -278,30 +288,50 @@ def daylength_hours(day_of_year, latitude):
     return 24.0 - (24.0 / math.pi) * math.acos(arg)
 
 
-def seasonal_fullvoltage(args, when=None):
-    """Full-charge voltage scaled by available solar energy.
+def seasonal_light(args, when=None):
+    """Today's clear-sky solar energy as a fraction of the year's range [0,1].
 
-    With args.winter_fullvoltage set, args.fullvoltage is the lightest-day
-    (summer) value and winter_fullvoltage the darkest-day value. The threshold
-    is interpolated by today's clear-sky solar energy between the yearly
-    extremes: less energy -> higher threshold -> the battery reads as less full
-    -> the Pi sleeps more. Energy (not daylength) is the driver because winter's
-    low sun angle cuts daily charge far more than the shorter day alone implies
-    (at mid-latitudes clear-sky energy bottoms out near 0.27x its summer peak,
-    versus ~0.6x for daylength), so the winter ramp arrives earlier and deeper.
-    Returns the static args.fullvoltage when winter_fullvoltage is unset.
+    Energy, not daylength, drives this: winter's low sun angle cuts daily charge
+    far more than the shorter day implies (clear-sky energy bottoms out near
+    0.27x its summer peak at mid-latitudes, versus ~0.6x for daylength).
     """
-    winter = getattr(args, 'winter_fullvoltage', 0)
-    if not winter:
-        return args.fullvoltage
     latitude = getattr(args, 'latitude', 0)
     when = when or datetime.date.today()
-    energies = [clearsky_radiation(d, latitude) for d in range(1, 366)]
+    energies = [clearsky_radiation(day, latitude) for day in range(1, 366)]
     emin, emax = min(energies), max(energies)
     today = clearsky_radiation(when.timetuple().tm_yday, latitude)
     light = (today - emin) / (emax - emin) if emax > emin else 1.0
-    light = max(0.0, min(1.0, light))
-    return winter + light * (args.fullvoltage - winter)
+    return max(0.0, min(1.0, light))
+
+
+def ramp_scale(floor, fraction):
+    """Interpolate a duty scale between floor (fraction 0) and 1.0 (fraction 1)."""
+    return floor + max(0.0, min(1.0, fraction)) * (1.0 - floor)
+
+
+def seasonal_duty_scale(args, when=None):
+    """Duty scale that banks energy into the pack as the season darkens.
+
+    Winter offers less energy than the pack can be relied on to replace, so the
+    same SOC must buy a lower duty. This is a policy about reserve, kept
+    separate from SOC, which stays a measurement.
+    """
+    floor = getattr(args, 'winter_duty_scale', 1.0)
+    if floor >= 1.0:
+        return 1.0
+    return ramp_scale(floor, seasonal_light(args, when))
+
+
+def forecast_duty_scale(args, factor):
+    """Duty scale that banks energy ahead of a forecast cloudy spell.
+
+    factor is the expected clear-sky fraction [0,1]; less light -> lower duty,
+    so the node sheds load BEFORE the pack sags rather than after.
+    """
+    floor = getattr(args, 'forecast_duty_scale', 1.0)
+    if floor >= 1.0 or factor is None:
+        return 1.0
+    return ramp_scale(floor, factor)
 
 
 def interp_soc(volts_per_cell, curve):
@@ -323,23 +353,22 @@ def interp_soc(volts_per_cell, curve):
     return socs[i - 1] + frac * (socs[i] - socs[i - 1])
 
 
-def calc_soc(mean_v, args, fullvoltage=None):
-    """Calculate battery SOC, by OCV curve when a chemistry is configured.
+def calc_soc(mean_v, args):
+    """Measure battery SOC, by OCV curve when a chemistry is configured.
 
     Falls back to the legacy linear ramp between --shutdownvoltage and
-    fullvoltage when --battery-chemistry is 'linear'.
+    --fullvoltage when --battery-chemistry is 'linear'. SOC is a measurement:
+    policy belongs in the duty scales, not in a moved goalpost here.
     """
     # TODO: IR-compensate with MEAN_C; a loaded reading sits below true OCV.
     curve = OCV_CURVES.get(getattr(args, 'battery_chemistry', 'linear'))
     if curve:
         return interp_soc(mean_v / args.battery_cells, curve)
-    if fullvoltage is None:
-        fullvoltage = args.fullvoltage
-    if mean_v >= fullvoltage:
+    if mean_v >= args.fullvoltage:
         return 100
     if mean_v <= args.shutdownvoltage:
         return 0
-    return (mean_v - args.shutdownvoltage) / (fullvoltage - args.shutdownvoltage) * 100
+    return (mean_v - args.shutdownvoltage) / (args.fullvoltage - args.shutdownvoltage) * 100
 
 
 def extraterrestrial_radiation(day_of_year, latitude):
@@ -556,22 +585,9 @@ def update_forecast(args, now=None, fetcher=fetch_forecast):
 
 
 def forecast_enabled(args):
-    """True when forecast scaling is opted in (a span and a real provider)."""
-    return (getattr(args, 'forecast_fullvoltage_span', 0.0) > 0 and
+    """True when forecast scaling is opted in (a scale and a real provider)."""
+    return (getattr(args, 'forecast_duty_scale', 1.0) < 1.0 and
             getattr(args, 'forecast_provider', 'none') != 'none')
-
-
-def effective_fullvoltage(args, factor, when=None):
-    """Seasonal full voltage plus a forecast bump when sunlight is restricted.
-
-    factor is the expected clear-sky fraction [0,1]; less light -> larger bump
-    -> battery reads less full -> the Pi sleeps more.
-    """
-    full = seasonal_fullvoltage(args, when)
-    span = getattr(args, 'forecast_fullvoltage_span', 0.0)
-    if not span or factor is None:
-        return full
-    return full + (1.0 - max(0.0, min(1.0, factor))) * span
 
 
 def call_script(script, timeout=SHUTDOWN_TIMEOUT):
@@ -624,22 +640,25 @@ def loop(args):
                 charging = charging_state(
                     trend, args.charge_trend_threshold, charging)
                 if window_diffs and sample_count >= args.window_samples:
-                    fullvoltage = effective_fullvoltage(args, forecast_factor)
-                    soc = calc_soc(response[MEAN_V], args, fullvoltage)
-                    duty = charge_aware_duty(soc, args, charging)
+                    soc = calc_soc(response[MEAN_V], args)
+                    seasonal_scale = seasonal_duty_scale(args)
+                    cloud_scale = forecast_duty_scale(args, forecast_factor)
+                    charge_scale = charging_duty_scale(args, charging)
+                    duty = policy_duty(
+                        soc, args, (seasonal_scale, cloud_scale, charge_scale))
                     window_summary = {
                         'window_diffs': window_diffs,
                         'soc': soc,
                         'duty': duty,
-                        'fullvoltage': fullvoltage,
                         'charging': charging,
+                        'seasonal_duty_scale': seasonal_scale,
+                        'forecast_duty_scale': cloud_scale,
+                        'charging_duty_scale': charge_scale,
                     }
                     if trend is not None:
                         window_summary['voltage_trend'] = trend
                     if forecast_enabled(args):
                         window_summary.update(forecast_telemetry)
-                        window_summary['forecast_bump'] = (
-                            fullvoltage - seasonal_fullvoltage(args))
                     log_json(args.log, window_summary, args.prometheus)
 
                     # persisted here so the pre-sleep sample survives the poweroff
@@ -725,22 +744,22 @@ def parse_args():
         help='voltage at which the battery is considered full (the '
              'lightest-day value when --winter-fullvoltage is set)')
     parser.add_argument(
-        '--winter-fullvoltage', default=0.0, type=float,
-        help='full voltage at the darkest day of the year; if set (>0), the '
-             'considered-full threshold is scaled by photoperiod between this '
-             'and --fullvoltage so the Pi sleeps more in the dark season')
+        '--winter-duty-scale', default=1.0, type=float,
+        help='duty scale at the darkest day of the year, ramping to 1.0 at the '
+             'lightest by clear-sky solar energy. Winter offers less energy '
+             'than the pack can be relied on to replace, so the same SOC buys '
+             'a lower duty and banks the difference (1.0 disables)')
     parser.add_argument(
         '--latitude', default=0.0, type=float,
-        help='site latitude in degrees (negative south) for --winter-fullvoltage')
+        help='site latitude in degrees (negative south) for --winter-duty-scale')
     parser.add_argument(
         '--longitude', default=0.0, type=float,
         help='site longitude in degrees (negative west) for the solar forecast')
     parser.add_argument(
-        '--forecast-fullvoltage-span', default=0.0, type=float,
-        help='max extra volts added to the considered-full threshold when the '
-             'solar forecast shows no sunlight; if set (>0), enables forecast '
-             'scaling on top of the seasonal threshold (the Pi sleeps more when '
-             'restricted sunlight is forecast)')
+        '--forecast-duty-scale', default=1.0, type=float,
+        help='duty scale when the solar forecast shows no sunlight, ramping to '
+             '1.0 at a clear forecast, so the node banks energy BEFORE a cloudy '
+             'spell rather than after it (1.0 disables)')
     parser.add_argument(
         '--forecast-provider', default='open-meteo',
         choices=sorted(FORECAST_PARSERS) + ['none'],
@@ -802,17 +821,15 @@ def parse_args():
     assert main_args.shutdownvoltage > main_args.deepsleepvoltage
     assert main_args.fullvoltage > main_args.shutdownvoltage
     assert main_args.soc_sleep_gamma > 0
-    assert 0.0 <= main_args.not_charging_duty_scale <= 1.0
     assert main_args.charge_trend_threshold >= 0
+    for scale in ('not_charging_duty_scale', 'winter_duty_scale',
+                  'forecast_duty_scale'):
+        assert 0.0 <= getattr(main_args, scale) <= 1.0, '%s must be 0..1' % scale
     if main_args.battery_chemistry != 'linear':
         assert main_args.battery_cells > 0, \
             '--battery-chemistry requires --battery-cells'
-        assert not main_args.winter_fullvoltage, \
-            '--winter-fullvoltage scales --fullvoltage, which an OCV curve ignores'
-        assert not forecast_enabled(main_args), \
-            '--forecast-fullvoltage-span scales --fullvoltage, which an OCV curve ignores'
-    if main_args.winter_fullvoltage:
-        assert main_args.winter_fullvoltage > main_args.fullvoltage
+    if main_args.winter_duty_scale < 1.0:
+        assert main_args.latitude, '--winter-duty-scale requires --latitude'
     if forecast_enabled(main_args) and main_args.forecast_provider == 'metservice':
         assert main_args.forecast_key, '--forecast-provider metservice requires --forecast-key'
     return main_args
